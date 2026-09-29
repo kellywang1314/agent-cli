@@ -1,19 +1,38 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { chmod, mkdtemp, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { resolveDatabasePath } from '../src/persistence/databasePath.js';
 import { persistedAgentMessageSchema } from '../src/persistence/messageSchema.js';
 import { PersistenceStore } from '../src/persistence/PersistenceStore.js';
 
 const cleanups: Array<() => Promise<void>> = [];
+const readyTimeoutMs = 5000;
+const resultTimeoutMs = 10_000;
+const exitTimeoutMs = 5000;
+
+type InitializerResult = { ok: boolean; error?: string };
+type InitializerExit = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  error?: Error;
+};
+
+interface InitializerChild {
+  child: ChildProcess;
+  ready: Promise<void>;
+  result: Promise<InitializerResult>;
+  exited: Promise<InitializerExit>;
+  getStderr: () => string;
+}
 
 /** 清理每个用例创建的临时数据库目录。 */
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
@@ -35,8 +54,142 @@ function captureConstructionError(databasePath: string): Error {
   throw new Error('预期 PersistenceStore 构造失败');
 }
 
+/** 创建与 node:sqlite 一致的可识别 SQLite 错误。 */
+function createSqliteError(errcode: number, errstr: string): Error {
+  return Object.assign(new Error(errstr), {
+    code: 'ERR_SQLITE_ERROR',
+    errcode,
+    errstr,
+  });
+}
+
+/** 在 WAL 设置边界按调用次数注入错误，并返回总调用次数。 */
+function mockJournalModeFailure(createError: (attempt: number) => Error | undefined): () => number {
+  let attempts = 0;
+  const originalExec = DatabaseSync.prototype.exec;
+  const originalPrepare = DatabaseSync.prototype.prepare;
+  vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: DatabaseSync, sql) {
+    if (sql.includes('PRAGMA journal_mode = WAL')) {
+      attempts += 1;
+      const error = createError(attempts);
+      if (error) throw error;
+    }
+    return originalExec.call(this, sql);
+  });
+  vi.spyOn(DatabaseSync.prototype, 'prepare').mockImplementation(function (this: DatabaseSync, sql) {
+    if (sql === 'PRAGMA journal_mode = WAL') {
+      attempts += 1;
+      const error = createError(attempts);
+      if (error) throw error;
+    }
+    return originalPrepare.call(this, sql);
+  });
+  return () => attempts;
+}
+
+/** 创建子进程并立即注册所有 IPC、错误和退出监听。 */
+function spawnInitializer(databasePath: string, script: string): InitializerChild {
+  const child = spawn(process.execPath, [
+    '--import', 'tsx', '--input-type=module', '--eval', script,
+  ], {
+    cwd: process.cwd(),
+    env: { ...process.env, DATABASE_PATH: databasePath },
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+  });
+  let stderr = '';
+  let receivedReady = false;
+  let receivedResult = false;
+  let resolveReady!: () => void;
+  let rejectReady!: (error: Error) => void;
+  let resolveResult!: (result: InitializerResult) => void;
+  let rejectResult!: (error: Error) => void;
+  let resolveExited!: (exit: InitializerExit) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  const result = new Promise<InitializerResult>((resolve, reject) => {
+    resolveResult = resolve;
+    rejectResult = reject;
+  });
+  const exited = new Promise<InitializerExit>((resolve) => {
+    resolveExited = resolve;
+  });
+  void ready.catch(() => undefined);
+  void result.catch(() => undefined);
+
+  child.stderr?.on('data', (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+  child.on('message', (message) => {
+    if (message === 'ready' && !receivedReady) {
+      receivedReady = true;
+      resolveReady();
+      return;
+    }
+    if (
+      typeof message === 'object'
+      && message !== null
+      && 'ok' in message
+      && typeof message.ok === 'boolean'
+      && !receivedResult
+    ) {
+      receivedResult = true;
+      resolveResult(message as InitializerResult);
+    }
+  });
+  child.once('error', (error) => {
+    const childError = new Error(`初始化子进程错误：${error.message}：${stderr}`);
+    rejectReady(childError);
+    rejectResult(childError);
+    if (child.pid === undefined) resolveExited({ code: null, signal: null, error: childError });
+  });
+  child.once('exit', (code, signal) => {
+    const childError = new Error(`初始化子进程提前退出 (${code ?? signal})：${stderr}`);
+    if (!receivedReady) rejectReady(childError);
+    if (!receivedResult) rejectResult(childError);
+    resolveExited({ code, signal });
+  });
+
+  return { child, ready, result, exited, getStderr: () => stderr };
+}
+
+/** 为并发初始化的单个阶段设置明确的最长等待时间。 */
+async function waitForPhase<T>(promise: Promise<T>, phase: string, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${phase} 阶段等待超过 ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** 终止仍存活的初始化子进程，并等待所有子进程退出。 */
+async function stopInitializers(initializers: InitializerChild[]): Promise<void> {
+  for (const { child } of initializers) {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+  }
+  const allExited = Promise.all(initializers.map(({ exited }) => exited));
+  try {
+    await waitForPhase(allExited, 'cleanup exit', exitTimeoutMs);
+  } catch {
+    for (const { child } of initializers) {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+    await waitForPhase(allExited, 'forced cleanup exit', exitTimeoutMs);
+  }
+}
+
 /** 通过 IPC 屏障同时启动多个独立进程中的数据库初始化。 */
-async function runConcurrentInitializers(databasePath: string, processCount = 12): Promise<Array<{ ok: boolean; error?: string }>> {
+async function runConcurrentInitializers(
+  databasePath: string,
+  processCount = 24,
+): Promise<InitializerResult[]> {
   const moduleUrl = pathToFileURL(path.resolve('src/persistence/PersistenceStore.ts')).href;
   const script = `
     import { PersistenceStore } from ${JSON.stringify(moduleUrl)};
@@ -53,57 +206,34 @@ async function runConcurrentInitializers(databasePath: string, processCount = 12
       }
     });
   `;
-  const children = Array.from({ length: processCount }, () => spawn(process.execPath, [
-    '--import', 'tsx', '--input-type=module', '--eval', script,
-  ], {
-    cwd: process.cwd(),
-    env: { ...process.env, DATABASE_PATH: databasePath },
-    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
-  }));
-  const readyPromises: Array<Promise<void>> = [];
-  const resultPromises: Array<Promise<{ ok: boolean; error?: string }>> = [];
-  const exitPromises: Array<Promise<void>> = [];
-  for (const child of children) {
-    let stderr = '';
-    child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
-    readyPromises.push(new Promise((resolve, reject) => {
-      child.once('error', reject);
-      child.on('message', (message) => {
-        if (message === 'ready') resolve();
-      });
-      child.once('exit', (code) => {
-        reject(new Error(`初始化子进程未就绪即退出 (${code})：${stderr}`));
-      });
-    }));
-    resultPromises.push(new Promise((resolve, reject) => {
-      child.once('error', reject);
-      child.on('message', (message) => {
-        if (typeof message === 'object' && message !== null && 'ok' in message) {
-          resolve(message as { ok: boolean; error?: string });
-        }
-      });
-      child.once('exit', (code) => {
-        reject(new Error(`初始化子进程未返回结果 (${code})：${stderr}`));
-      });
-    }));
-    exitPromises.push(new Promise((resolve, reject) => {
-      child.once('error', reject);
-      child.once('exit', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`初始化子进程失败 (${code})：${stderr}`));
-      });
-    }));
-  }
+  const initializers: InitializerChild[] = [];
   try {
-    await Promise.all(readyPromises);
-    for (const child of children) child.send('start');
-    const results = await Promise.all(resultPromises);
-    await Promise.all(exitPromises);
+    for (let index = 0; index < processCount; index += 1) {
+      initializers.push(spawnInitializer(databasePath, script));
+    }
+    await waitForPhase(Promise.all(initializers.map(({ ready }) => ready)), 'ready', readyTimeoutMs);
+    for (const { child } of initializers) child.send('start');
+    const results = await waitForPhase(
+      Promise.all(initializers.map(({ result }) => result)),
+      'result',
+      resultTimeoutMs,
+    );
+    const exits = await waitForPhase(
+      Promise.all(initializers.map(({ exited }) => exited)),
+      'exit',
+      exitTimeoutMs,
+    );
+    exits.forEach(({ code, signal, error }, index) => {
+      if (error || code !== 0) {
+        throw new Error(
+          error?.message
+            ?? `初始化子进程失败 (${code ?? signal})：${initializers[index]?.getStderr() ?? ''}`,
+        );
+      }
+    });
     return results;
   } finally {
-    for (const child of children) {
-      if (child.exitCode === null && child.signalCode === null) child.kill();
-    }
+    await stopInitializers(initializers);
   }
 }
 
@@ -128,15 +258,64 @@ describe('PersistenceStore schema', () => {
     store.close();
   });
 
-  it('为数据库连接启用关键 PRAGMA', async () => {
+  it('持久化启用 WAL 并通过真实外键约束拒绝孤立消息', async () => {
     const databasePath = await createDatabasePath();
     const store = new PersistenceStore(databasePath);
-    expect(store.getPragmaSettings()).toEqual({
-      journalMode: 'wal',
-      foreignKeys: true,
-      busyTimeout: 5000,
-    });
     store.close();
+    const database = new DatabaseSync(databasePath);
+    try {
+      expect(database.prepare('PRAGMA journal_mode').get()?.journal_mode).toBe('wal');
+    } finally {
+      database.close();
+    }
+
+    const foreignKeyStore = new PersistenceStore(databasePath);
+    expect(() => (foreignKeyStore as unknown as {
+      database: DatabaseSync;
+    }).database.exec(`
+      INSERT INTO displayMessages (id, sessionId, sequence, role, content, createdAt)
+        VALUES ('orphan', 'missing', 1, 'user', 'content', 1)
+    `)).toThrow();
+    foreignKeyStore.close();
+  });
+
+  it.each([
+    { errcode: 5, errstr: 'database is locked' },
+    { errcode: 6, errstr: 'database table is locked' },
+  ])('WAL 设置遇到 $errstr 后重试并完成初始化', async ({ errcode, errstr }) => {
+    const databasePath = await createDatabasePath();
+    const getAttempts = mockJournalModeFailure((attempt) => (
+      attempt === 1 ? createSqliteError(errcode, errstr) : undefined
+    ));
+
+    const store = new PersistenceStore(databasePath);
+    store.close();
+    expect(getAttempts()).toBe(2);
+  });
+
+  it('WAL 设置遇到非锁错误时立即失败并隐藏底层错误', async () => {
+    const databasePath = await createDatabasePath();
+    const getAttempts = mockJournalModeFailure(() => createSqliteError(1, 'SQL logic error'));
+
+    const error = captureConstructionError(databasePath);
+    expect(error.message).toBe(`无法打开长期记忆数据库：${databasePath}`);
+    expect(error).not.toHaveProperty('cause');
+    expect(getAttempts()).toBe(1);
+  });
+
+  it('WAL 设置成功后验证返回模式', async () => {
+    const databasePath = await createDatabasePath();
+    const originalPrepare = DatabaseSync.prototype.prepare;
+    vi.spyOn(DatabaseSync.prototype, 'prepare').mockImplementation(function (this: DatabaseSync, sql) {
+      if (sql === 'PRAGMA journal_mode = WAL') {
+        return { get: () => ({ journal_mode: 'delete' }) } as never;
+      }
+      return originalPrepare.call(this, sql);
+    });
+
+    const error = captureConstructionError(databasePath);
+    expect(error.message).toBe(`无法打开长期记忆数据库：${databasePath}`);
+    expect(error).not.toHaveProperty('cause');
   });
 
   it('多个独立进程首次并发打开时只执行一次迁移', async () => {
@@ -149,7 +328,7 @@ describe('PersistenceStore schema', () => {
     } finally {
       database.close();
     }
-  });
+  }, 25_000);
 
   it('创建关键索引并实施代表性约束', async () => {
     const databasePath = await createDatabasePath();

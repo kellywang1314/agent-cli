@@ -1,8 +1,12 @@
 import { chmodSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 
 const schemaVersion = 1;
+const busyTimeoutMs = 5000;
+const walRetryIntervalMs = 25;
+const walRetrySignal = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 
 class UnsupportedDatabaseVersionError extends Error {
   /** 创建包含实际版本号的兼容性错误。 */
@@ -78,6 +82,32 @@ CREATE INDEX candidatesSessionStatus ON memoryCandidates(sourceSessionId, status
 PRAGMA user_version = 1;
 `;
 
+/** 判断错误是否为 SQLite 的 busy 或 locked 锁冲突。 */
+function isSqliteLockError(error: unknown): boolean {
+  if (!(error instanceof Error) || Reflect.get(error, 'code') !== 'ERR_SQLITE_ERROR') return false;
+  const errorCode = Reflect.get(error, 'errcode');
+  return typeof errorCode === 'number' && [5, 6].includes(errorCode & 0xff);
+}
+
+/** 在 busy timeout 总期限内同步重试 WAL 切换，并验证最终模式。 */
+function enableWriteAheadLogging(database: DatabaseSync): void {
+  const deadline = performance.now() + busyTimeoutMs;
+  while (true) {
+    try {
+      const journalMode = String(
+        database.prepare('PRAGMA journal_mode = WAL').get()?.journal_mode ?? '',
+      );
+      if (journalMode !== 'wal') throw new Error(`无法启用 WAL 模式：${journalMode}`);
+      return;
+    } catch (error) {
+      if (!isSqliteLockError(error)) throw error;
+      const remainingMs = deadline - performance.now();
+      if (remainingMs <= 0) throw error;
+      Atomics.wait(walRetrySignal, 0, 0, Math.min(walRetryIntervalMs, remainingMs));
+    }
+  }
+}
+
 export class PersistenceStore {
   private readonly database: DatabaseSync;
 
@@ -90,7 +120,9 @@ export class PersistenceStore {
       if (createdDirectory !== undefined) chmodSync(directory, 0o700);
       database = new DatabaseSync(databasePath);
       chmodSync(databasePath, 0o600);
-      database.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;');
+      database.exec('PRAGMA foreign_keys = ON');
+      enableWriteAheadLogging(database);
+      database.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
       let transactionStarted = false;
       try {
         database.exec('BEGIN IMMEDIATE');
@@ -124,15 +156,6 @@ export class PersistenceStore {
   /** 返回 SQLite Schema 版本。 */
   getSchemaVersion(): number {
     return Number(this.database.prepare('PRAGMA user_version').get()?.user_version ?? 0);
-  }
-
-  /** 返回当前连接的关键 SQLite 初始化设置。 */
-  getPragmaSettings(): { journalMode: string; foreignKeys: boolean; busyTimeout: number } {
-    return {
-      journalMode: String(this.database.prepare('PRAGMA journal_mode').get()?.journal_mode ?? ''),
-      foreignKeys: Boolean(Number(this.database.prepare('PRAGMA foreign_keys').get()?.foreign_keys ?? 0)),
-      busyTimeout: Number(this.database.prepare('PRAGMA busy_timeout').get()?.timeout ?? 0),
-    };
   }
 
   /** 返回按名称排序的业务表，供迁移检查使用。 */

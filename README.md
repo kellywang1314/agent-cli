@@ -4,7 +4,7 @@
 
 ## 启动
 
-需要 Node.js 22+、pnpm 10；`getDiff` 另需 Git。
+需要 Node.js 22.13+、pnpm 10；`getDiff` 另需 Git。
 
 ```bash
 cd /Users/bytedance/Documents/trae_projects/agent-cli
