@@ -18,6 +18,9 @@ export type AgentEvent =
 interface AgentOptions {
   systemPrompt: string;
   maxRounds: number;
+  initialMessages?: ChatCompletionMessageParam[];
+  getRuntimeInstructions?: () => Promise<string>;
+  onMessagesAppended?: (messages: ChatCompletionMessageParam[]) => Promise<void>;
   sanitize?: (text: string) => string;
   onEvent?: (event: AgentEvent) => void;
 }
@@ -42,23 +45,44 @@ export class AgentLoop {
     private readonly tools: ToolExecutor,
     private readonly options: AgentOptions,
   ) {
-    this.messages = [{ role: 'system', content: options.systemPrompt }];
+    this.messages = structuredClone(options.initialMessages ?? []);
   }
 
-  /** 返回历史副本，防止外部改坏工具消息配对。 */
+  /** 返回包含当前基础系统提示词的请求历史副本。 */
   getMessages(): ChatCompletionMessageParam[] {
+    return [{ role: 'system', content: this.options.systemPrompt }, ...structuredClone(this.messages)];
+  }
+
+  /** 返回不含动态系统消息的可持久化会话历史。 */
+  getConversationMessages(): ChatCompletionMessageParam[] {
     return structuredClone(this.messages);
   }
 
   /** 清空空闲会话，保留系统和项目约束。 */
   clear(): void {
     if (this.busy) throw new Error('请先中断当前任务');
-    this.messages = [{ role: 'system', content: this.options.systemPrompt }];
+    this.messages = [];
+  }
+
+  /** 先可靠持久化，再更新内存历史，避免模型看到无法恢复的消息。 */
+  private async appendMessages(messages: ChatCompletionMessageParam[]): Promise<void> {
+    await this.options.onMessagesAppended?.(structuredClone(messages));
+    this.messages.push(...messages);
+  }
+
+  /** 使用当前系统规则和当前记忆构造一次模型请求。 */
+  private async requestMessages(): Promise<ChatCompletionMessageParam[]> {
+    const runtime = (await this.options.getRuntimeInstructions?.())?.trim();
+    return [
+      { role: 'system', content: this.options.systemPrompt },
+      ...(runtime ? [{ role: 'system' as const, content: runtime }] : []),
+      ...structuredClone(this.messages),
+    ];
   }
 
   /** 记录并返回因循环保护而终止的结果。 */
-  private finish(message: string): string {
-    this.messages.push({ role: 'assistant', content: message });
+  private async finish(message: string): Promise<string> {
+    await this.appendMessages([{ role: 'assistant', content: message }]);
     this.options.onEvent?.({ type: 'text', text: message });
     return message;
   }
@@ -69,27 +93,27 @@ export class AgentLoop {
     if (!prompt.trim()) throw new Error('请输入任务');
     context.signal.throwIfAborted();
     this.busy = true;
-    this.messages.push({ role: 'user', content: prompt });
     const signatures = new Map<string, number>();
     try {
+      await this.appendMessages([{ role: 'user', content: prompt }]);
       for (let round = 1; round <= this.options.maxRounds; round++) {
         context.signal.throwIfAborted();
         this.options.onEvent?.({ type: 'thinking', round });
-        const reply = await this.provider.chat(this.messages, this.tools.getDefinitions(),
+        const reply = await this.provider.chat(await this.requestMessages(), this.tools.getDefinitions(),
           (text) => this.options.onEvent?.({ type: 'text', text }), context.signal);
         context.signal.throwIfAborted();
         if (!reply.toolCalls.length) {
-          this.messages.push({ role: 'assistant', content: reply.content });
+          await this.appendMessages([{ role: 'assistant', content: reply.content }]);
           return reply.content;
         }
         if (reply.toolCalls.length > 16) return this.finish('单轮工具调用超过 16 个，已停止，请拆分任务。');
-        this.messages.push({
+        await this.appendMessages([{
           role: 'assistant',
           content: reply.content || null,
           tool_calls: reply.toolCalls.map((call) => ({
             id: call.id, type: 'function', function: { name: call.name, arguments: call.arguments },
           })),
-        });
+        }]);
         let repeated = false;
         for (const [index, call] of reply.toolCalls.entries()) {
           const startedAt = Date.now();
@@ -109,16 +133,17 @@ export class AgentLoop {
             }
           } catch (error) {
             if (context.signal.aborted) {
-              for (const pending of reply.toolCalls.slice(index)) {
-                this.messages.push({ role: 'tool', tool_call_id: pending.id, content: '{"error":"用户已中断，未完成"}' });
-              }
+              const interruptedMessages: ChatCompletionMessageParam[] = reply.toolCalls.slice(index).map((pending) => ({
+                role: 'tool', tool_call_id: pending.id, content: '{"error":"用户已中断，未完成"}',
+              }));
+              await this.appendMessages(interruptedMessages);
               context.signal.throwIfAborted();
             }
             result = { error: error instanceof Error ? error.message : String(error) };
           }
           const serialized = JSON.stringify(result) ?? 'null';
           const content = this.options.sanitize?.(serialized) ?? serialized;
-          this.messages.push({ role: 'tool', tool_call_id: call.id, content });
+          await this.appendMessages([{ role: 'tool', tool_call_id: call.id, content }]);
           this.options.onEvent?.({ type: 'toolEnd', name: call.name, result: content, elapsedMs: Date.now() - startedAt });
         }
         context.signal.throwIfAborted();
