@@ -695,7 +695,80 @@ describe('PersistenceStore session CRUD', () => {
     store.close();
   });
 
-  it('恢复多个会话时仅补齐后续未配对的 tool call 且重复调用幂等', async () => {
+  it.each([
+    { field: 'title', patch: { title: 42 } },
+    { field: 'title', patch: { title: undefined } },
+    { field: 'status', patch: { status: 'paused' } },
+    { field: 'memoryExtractionStatus', patch: { memoryExtractionStatus: 'pending' } },
+    { field: 'memoryExtractionError', patch: { memoryExtractionError: 404 } },
+    { field: 'updatedAt', patch: { updatedAt: Number.NaN } },
+    { field: 'updatedAt', patch: { updatedAt: Number.POSITIVE_INFINITY } },
+    { field: 'updatedAt', patch: { updatedAt: 1.5 } },
+    { field: 'updatedAt', patch: { updatedAt: -1 } },
+  ])('拒绝非法 $field patch 值且不修改会话', async ({ field, patch }) => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    const session = buildSession();
+    store.createSession(session);
+
+    expect(() => store.updateSession(session.id, patch as never))
+      .toThrow(`无效的会话更新字段值：${field}`);
+    expect(store.getSession(session.id)).toEqual(session);
+    store.close();
+  });
+
+  it('恢复时不修补 idle 会话的未配对工具调用', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    const session = buildSession({ memoryExtractionStatus: 'running' });
+    store.createSession(session);
+    store.appendAgentMessages(session.id, [{
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'call-idle',
+        type: 'function',
+        function: { name: 'readFile', arguments: '{}' },
+      }],
+    }]);
+
+    store.recoverInterruptedWork();
+
+    expect(store.getSession(session.id)).toMatchObject({
+      status: 'idle',
+      memoryExtractionStatus: 'failed',
+      memoryExtractionError: '服务重启，记忆提取未完成',
+    });
+    expect(store.loadAgentMessages(session.id)).toHaveLength(1);
+    store.close();
+  });
+
+  it('恢复时不修补最后普通 assistant 回复之前的工具调用', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    const session = buildSession({ status: 'running' });
+    store.createSession(session);
+    store.appendAgentMessages(session.id, [
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call-earlier',
+          type: 'function',
+          function: { name: 'readFile', arguments: '{}' },
+        }],
+      },
+      { role: 'assistant', content: '已完成' },
+    ]);
+
+    store.recoverInterruptedWork();
+
+    expect(store.loadAgentMessages(session.id)).toHaveLength(2);
+    expect(store.getSession(session.id).status).toBe('interrupted');
+    store.close();
+  });
+
+  it('恢复 running 会话时仅补最后 assistant 的缺失调用且重复调用幂等', async () => {
     const databasePath = await createDatabasePath();
     const store = new PersistenceStore(databasePath);
     const firstSession = buildSession({ id: 'session-1', status: 'running' });

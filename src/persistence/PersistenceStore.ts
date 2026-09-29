@@ -25,6 +25,28 @@ const sessionPatchColumns = {
   updatedAt: 'updatedAt',
 } as const satisfies Record<keyof SessionPatch, string>;
 type SessionPatchKey = keyof typeof sessionPatchColumns;
+const sessionStatuses = new Set<StoredSession['status']>([
+  'idle', 'running', 'interrupted', 'failed',
+]);
+const memoryExtractionStatuses = new Set<StoredSession['memoryExtractionStatus']>([
+  'idle', 'running', 'failed', 'complete',
+]);
+
+/** 按字段约束校验会话更新值，避免依赖 SQLite 动态类型转换。 */
+function isValidSessionPatchValue(key: SessionPatchKey, value: unknown): boolean {
+  switch (key) {
+    case 'title':
+      return typeof value === 'string';
+    case 'status':
+      return sessionStatuses.has(value as StoredSession['status']);
+    case 'memoryExtractionStatus':
+      return memoryExtractionStatuses.has(value as StoredSession['memoryExtractionStatus']);
+    case 'memoryExtractionError':
+      return typeof value === 'string' || value === null;
+    case 'updatedAt':
+      return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+  }
+}
 
 class UnsupportedDatabaseVersionError extends Error {
   /** 创建包含实际版本号的兼容性错误。 */
@@ -235,11 +257,16 @@ export class PersistenceStore {
     return Number(row?.sequence ?? 0);
   }
 
-  /** 校验 patch 字段并更新已有会话，空 patch 保持无操作。 */
+  /** 校验 patch 字段及运行时值并更新已有会话，空 patch 保持无操作。 */
   private applySessionPatch(id: string, patch: SessionPatch): void {
     for (const key of Object.keys(patch)) {
       if (!Object.hasOwn(sessionPatchColumns, key)) {
         throw new Error(`不支持的会话更新字段：${key}`);
+      }
+      const patchKey = key as SessionPatchKey;
+      const value = patch[patchKey];
+      if (!isValidSessionPatchValue(patchKey, value)) {
+        throw new Error(`无效的会话更新字段值：${key}`);
       }
     }
     const keys = (Object.keys(sessionPatchColumns) as SessionPatchKey[])
@@ -452,27 +479,51 @@ export class PersistenceStore {
   /** 补齐中断工具结果，并修复运行中的会话与记忆提取状态。 */
   recoverInterruptedWork(): void {
     this.transaction(() => {
-      const pendingToolCalls = new Map<string, Set<string>>();
-      const rows = this.database.prepare(`
-        SELECT sessionId, payloadJson
+      const runningSessionTails = this.database.prepare(`
+        SELECT
+          sessions.id AS sessionId,
+          latestAssistant.sequence AS assistantSequence,
+          latestAssistant.payloadJson AS assistantPayloadJson
+        FROM sessions
+        LEFT JOIN agentMessages AS latestAssistant
+          ON latestAssistant.id = (
+            SELECT agentMessages.id
+            FROM agentMessages
+            WHERE agentMessages.sessionId = sessions.id
+              AND json_extract(agentMessages.payloadJson, '$.role') = ?
+            ORDER BY agentMessages.sequence DESC
+            LIMIT 1
+          )
+        WHERE sessions.status = ?
+      `).all('assistant', 'running');
+      const followingToolMessages = this.database.prepare(`
+        SELECT payloadJson
         FROM agentMessages
-        ORDER BY sessionId ASC, sequence ASC
-      `).all();
-      for (const row of rows) {
+        WHERE sessionId = ?
+          AND sequence > ?
+          AND json_extract(payloadJson, '$.role') = ?
+        ORDER BY sequence ASC
+      `);
+      const pendingToolCalls = new Map<string, Set<string>>();
+      for (const row of runningSessionTails) {
         const sessionId = String(row.sessionId);
-        const message = persistedAgentMessageSchema.parse(
-          JSON.parse(String(row.payloadJson)),
+        if (row.assistantPayloadJson === null) continue;
+        const assistantMessage = persistedAgentMessageSchema.parse(
+          JSON.parse(String(row.assistantPayloadJson)),
         );
-        let pending = pendingToolCalls.get(sessionId);
-        if (!pending) {
-          pending = new Set<string>();
-          pendingToolCalls.set(sessionId, pending);
+        if (assistantMessage.role !== 'assistant' || !assistantMessage.tool_calls?.length) continue;
+        const pending = new Set(assistantMessage.tool_calls.map((toolCall) => toolCall.id));
+        for (const toolRow of followingToolMessages.all(
+          sessionId,
+          Number(row.assistantSequence),
+          'tool',
+        )) {
+          const toolMessage = persistedAgentMessageSchema.parse(
+            JSON.parse(String(toolRow.payloadJson)),
+          );
+          if (toolMessage.role === 'tool') pending.delete(toolMessage.tool_call_id);
         }
-        if (message.role === 'assistant') {
-          for (const toolCall of message.tool_calls ?? []) pending.add(toolCall.id);
-        } else if (message.role === 'tool') {
-          pending.delete(message.tool_call_id);
-        }
+        if (pending.size > 0) pendingToolCalls.set(sessionId, pending);
       }
 
       const insert = this.database.prepare(`
