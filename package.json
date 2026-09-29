@@ -8,7 +8,7 @@
     "agent-cli": "./dist/main.js"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.5.0"
   },
   "packageManager": "pnpm@10.11.1",
   "scripts": {

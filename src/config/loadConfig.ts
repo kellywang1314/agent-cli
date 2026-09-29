@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { z } from 'zod';
+import { resolveDatabasePath } from '../persistence/databasePath.js';
 
 export interface ConfigInput {
   apiKey?: string;
@@ -9,6 +10,7 @@ export interface ConfigInput {
   imageModel?: string;
   workspace?: string;
   maxRounds?: number;
+  databasePath?: string;
 }
 
 const endpointSchema = z.string().url().refine((value) => {
@@ -25,6 +27,7 @@ const configSchema = z.object({
   imageModel: z.string().trim().min(1),
   workspace: z.string().min(1),
   maxRounds: z.number().int().min(1).max(100),
+  databasePath: z.string().min(1),
 });
 
 export type AgentConfig = z.infer<typeof configSchema>;
@@ -40,6 +43,7 @@ export function loadConfig(input: ConfigInput = {}, env: NodeJS.ProcessEnv = pro
     imageModel: input.imageModel || env.AIDP_IMAGE_MODEL || model,
     workspace: path.resolve(input.workspace ?? process.cwd()),
     maxRounds: input.maxRounds ?? 20,
+    databasePath: path.resolve(input.databasePath ?? resolveDatabasePath(env)),
   });
   if (!parsed.success) {
     throw new Error(`配置错误：${parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('；')}`);
