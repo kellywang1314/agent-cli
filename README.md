@@ -1,0 +1,163 @@
+# Agent CLI
+
+参考[《实现一个自己的 Agent cli》](https://juejin.cn/post/7645339907674243082)，用 Node.js、TypeScript、React 实现本地代码 Agent 工作台，并保留 Ink 终端界面。模型通过 OpenAI 兼容协议接入 AIDP。
+
+## 启动
+
+需要 Node.js 22+、pnpm 10；`getDiff` 另需 Git。
+
+```bash
+cd /Users/bytedance/Documents/trae_projects/agent-cli
+pnpm install
+cp .env.example .env
+```
+
+在本地 `.env` 中填写 `AIDP_API_KEY`，然后启动可视化工作台：
+
+```bash
+pnpm dev
+# 指定要分析和修改的项目
+pnpm dev --workspace /absolute/path/to/project
+```
+
+服务仅监听 `127.0.0.1`，启动后会在 macOS 默认浏览器中打开类似 Codex 的本地界面。终端会同时显示带临时访问令牌的完整 URL；浏览器刷新后会话仍在，关闭服务后清空。AK 只由本地 Node 服务读取，不发送给页面。
+
+`.env` 从启动时的当前目录读取，`--workspace` 仅指定工具工作区。如果从其他目录启动构建产物，可设置 `DOTENV_CONFIG_PATH=/absolute/path/to/agent-cli/.env`，或直接配置环境变量。使用其他端口或不自动打开浏览器：
+
+```bash
+pnpm dev --port 4400
+pnpm dev --no-open
+```
+
+编译和运行：
+
+```bash
+pnpm build
+pnpm start --workspace /absolute/path/to/project
+node dist/web/main.js --help
+```
+
+原终端界面仍可使用：
+
+```bash
+pnpm dev:cli
+pnpm start:cli
+```
+
+包中声明的 `agent-cli` bin 对应终端版；如果希望系统中直接调用，可自行执行 `pnpm link --global`。终端交互需要 TTY，不能直接用管道传入文本。
+
+## 配置
+
+CLI 参数优先于环境变量。
+
+| 环境变量 | CLI 参数 | 默认值 |
+| --- | --- | --- |
+| `AIDP_API_KEY` | `--api-key` | 必填，推荐 `.env` |
+| `AIDP_MODEL` | `--model` | `gpt-5.5-2026-04-24` |
+| `AIDP_IMAGE_MODEL` | `--image-model` | 沿用聊天模型 |
+| `AIDP_CHAT_URL` | `--chat-url` | 下方聊天地址 |
+| `AIDP_IMAGE_URL` | `--image-url` | 下方图片地址 |
+| — | `--workspace` | 当前目录 |
+| — | `--max-rounds` | 20，范围 1–100 |
+
+```text
+聊天：https://aidp.bytedance.net/api/modelhub/online/v2/crawl
+图片：https://aidp.bytedance.net/api/modelhub/online/v2/crawl/openai/images/generations
+```
+
+**聊天地址是完整端点，不要追加 `/openai/chat/completions`，该路径会返回 404。** URL 配置中不要包含 `ak`；程序发请求时自动注入。端点依据 [ModelHub 接入示例](https://bytedance.larkoffice.com/docx/ETX2dNa4lokExhxMjQIcurlOnIc)，已于 2026-09-29 使用 `gpt-5.5-2026-04-24` 验证 SSE 聊天、`tools` / `tool_calls` 和工具结果回传。不支持 Responses 协议或网关自定义包装。
+
+**图片生成能力也需联调确认。** 默认模型名称按用户指定配置，不代表该模型必然支持图片接口。若网关要求专门的图片模型，请设置 `AIDP_IMAGE_MODEL`。图片解析支持标准 `data[0].url` / `data[0].b64_json`，仅接收 PNG/JPEG/WebP，最大 20 MiB。默认文件名为 `.png`，指定其他输出格式时请同时指定对应扩展名；程序保存原始图片字节，不转码。
+
+## 交互
+
+可视化界面包含左侧会话列表、中间流式对话和右侧工作区面板。右侧可查看工具过程、浏览普通文本文件及检查未暂存 Git diff。每个会话拥有独立模型历史，最多保留 20 个；刷新页面不会丢失，服务重启后清空。
+
+发送使用 Enter，换行使用 Shift+Enter。任务运行时发送按钮变为停止按钮。写文件、运行命令和图片生成会在对话区展示完整确认卡片，审批 ID 过期后无法误操作后续任务。
+
+```text
+❯ 列出项目结构，阅读 README，总结代码入口
+❯ 修复 src/example.ts 中的问题，先读文件，展示补丁，再执行测试
+❯ /image 一只坐在木桌上的橘猫，暖色自然光，真实摄影
+```
+
+| 命令 | 行为 |
+| --- | --- |
+| `/help` | 显示帮助 |
+| `/clear` | 清理会话和界面记录，保留项目规则 |
+| `/exit` | 退出 |
+| `/image <提示词>` | 直接请求生成并保存图片 |
+| `Ctrl+C` | 中断当前任务；再次按下退出。空闲时退出 |
+
+自然语言也能触发图片工具，并指定 `outputPath`、`model`、`size`。图片保存到工作区下的 `generated/`，或用户指定的相对路径。
+
+可视化界面使用“允许执行”或“拒绝”处理确认。终端版按 `y` 允许，`n`、回车或 Esc 拒绝；长内容按终端尺寸分页，用左右方向键或 PgUp/PgDn 查阅。确认图片前会展示提示词和路径；拒绝时不会发图片请求或创建文件。
+
+## 工具
+
+| 工具 | 参数示例 | 行为 |
+| --- | --- | --- |
+| `listFiles` | `{"path":".","maxEntries":500}` | 有界递归列出目录和文件 |
+| `readFile` | `{"path":"src/main.tsx","maxBytes":65536}` | 读取 UTF-8 文本，最大 64 KiB |
+| `search` | `{"query":"handleSubmit","path":"src","maxResults":100}` | 按行搜索字面量 |
+| `applyPatch` | `{"patch":"--- a/file\n+++ b/file\n@@ ...\n..."}` | 单文件 unified diff 增删改 |
+| `runCommand` | `{"command":"pnpm test","timeoutMs":30000}` | 确认后执行 Shell，最长 60 秒 |
+| `getDiff` | `{}` | 当前工作区内的 Git 未暂存差异 |
+| `generateImage` | `{"prompt":"一只小猫","outputPath":"generated/cat.png"}` | 确认后调用图片接口并保存 |
+
+补丁不支持重命名、多文件补丁、二进制或模式变更。多文件修改需分别确认；新增/删除使用 `/dev/null`。授权等待期间文件变化会拒绝应用，模型需重新读文件。
+
+自动目录遍历、搜索和 `readFile` 均拒绝 `.git`、`node_modules`、`.env*` 与符号链接；其他显式文件读取限制在工作区内普通文本。搜索有访问文件数、总读取字节数和输出数量上限，结果用 `truncated` 标记截断。`getDiff` 不显示未跟踪文件和已暂存改动。
+
+## 权限和运行边界
+
+文件工具会检查路径和现存父目录真实位置，拒绝目录穿越、符号链接越界和 `.git` 访问；写入前会再次校验。密钥不写入源码或日志，终端错误及回传模型的工具结果会脱敏，子进程不继承 `AIDP*` / `OPENAI*` 环境变量。
+
+**Shell 不是操作系统沙箱。** 确认的命令以当前系统用户身份运行，即使 cwd 在工作区，也能访问工作区外文件、网络及本地 `.env`。只确认你理解的命令。文件工具的校验也无法完全消除恶意进程同时替换父目录的竞争条件，勿把它作为隔离不可信系统用户的安全边界。
+
+命令输出最多保留 64 KiB；超时和取消会终止进程组。非零退出码作为观察结果交给模型。聊天请求超时 120 秒，连接与部分 HTTP 错误由 SDK 最多重试两次；已开始的流不重放。图片生成不自动重试，避免重复计费。
+
+## 源码入口
+
+```text
+src/main.tsx                  参数解析、项目上下文、Ink 启动
+src/config/loadConfig.ts      配置校验与输出脱敏
+src/providers/AidpProvider.ts  AIDP 聊天流和图片解析
+src/agent/AgentLoop.ts         历史、工具循环、取消、循环限制
+src/context/projectContext.ts 有限读取 README.md / AGENTS.md
+src/prompts/systemPrompt.ts    模型工作规则
+src/tools/ToolRegistry.ts      JSON Schema 与 Zod 校验
+src/tools/builtin/             七个工具
+src/tools/services/            有界文件操作和进程执行
+src/security/                 路径校验、逐次权限确认
+src/ui/App.tsx                终端交互与任务状态
+src/ui/PermissionPrompt.tsx   可翻页的完整操作预览
+src/web/main.ts               本地可视化服务入口
+src/web/server.ts             HTTP/SSE、鉴权与静态资源
+src/web/sessions.ts           浏览器会话、Agent 与审批桥接
+src/web/Workbench.tsx         三栏工作台主界面
+```
+
+每个用户任务依次执行“模型决策 → 工具确认与执行 → 结果回传 → 模型继续”。工具失败进入历史作为观察结果；取消时给剩余工具补齐取消结果，避免下一次请求出现未配对的 `tool_call_id`。
+
+首版不包含 MCP、子 Agent、会话持久化或上下文压缩。长会话可通过 `/clear` 重新开始；连续三次同参数工具调用会触发停止保护。
+
+## 验证与联调
+
+```bash
+pnpm typecheck
+pnpm test
+pnpm build
+```
+
+自动测试使用临时工作区、本地 HTTP 模型网关和 Ink 输入事件，不请求真实 AIDP。覆盖文件越界、权限允许/拒绝、补丁过期、命令取消/超时/截断、流式参数组装、图片格式、消息配对、循环限制、终端交互，以及工作台鉴权、会话隔离、审批过期与只读检查接口。
+
+真实接口联调：
+
+1. 配置 `.env` 并启动 CLI，输入“只回复 OK”验证聊天地址和模型。
+2. 输入“读取 README.md 并概括”，确认网关支持工具调用。
+3. 在临时样例项目中要求修改一个文件，先拒绝，再允许；检查真实差异。
+4. 运行 `/image <提示词>`，确认后检查返回路径和图片。
+5. 若 HTTP 404，检查 `.env` 或 `--chat-url` 是否仍配置了旧的 `/v2/crawl/openai/chat/completions`，改为上方完整聊天端点并重启；若 401/403，检查密钥与权限；若模型不支持图片，配置图片专用模型。
+
+设计与计划位于 `docs/superpowers/`。测试通过不能替代真实网关联调。
