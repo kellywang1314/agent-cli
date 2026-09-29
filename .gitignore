@@ -8,3 +8,4 @@ coverage/
 generated/
 *.log
 .superpowers/
+.worktrees/
