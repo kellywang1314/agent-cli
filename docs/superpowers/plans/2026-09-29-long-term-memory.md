@@ -6,7 +6,7 @@
 
 **Architecture:** 使用 `PersistenceStore` 独占 SQLite 访问，`SessionService` 统一编排会话和 Agent 执行，`MemoryService` 负责候选提取、确认、去重和动态注入。Web 与 CLI 只维护各自的展示状态和交互，复用相同的服务层；系统提示词和项目记忆在每次模型请求时动态组合，不持久化到模型消息表。
 
-**Tech Stack:** Node.js 22.5+、TypeScript、`node:sqlite`、Zod、React 19、Ink 6、原生 HTTP/SSE、Vitest、Playwright Core。
+**Tech Stack:** Node.js 22.13+、TypeScript、`node:sqlite`、Zod、React 19、Ink 6、原生 HTTP/SSE、Vitest、Playwright Core。
 
 ---
 
@@ -117,7 +117,7 @@ git commit -m "chore: establish agent cli baseline"
 在 `tests/persistence.test.ts` 写入：
 
 ```ts
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -144,13 +144,23 @@ describe('PersistenceStore schema', () => {
     expect(resolveDatabasePath({ AGENT_CLI_DB_PATH: './custom.db' }, '/tmp')).toBe('/tmp/custom.db');
   });
 
-  it('首次打开创建版本 1 Schema 和仅用户可访问的数据目录', async () => {
+  it('首次打开创建版本 1 Schema 且不修改已有父目录权限', async () => {
     const databasePath = await createDatabasePath();
+    await chmod(path.dirname(databasePath), 0o755);
     const store = new PersistenceStore(databasePath);
     expect(store.getSchemaVersion()).toBe(1);
     expect(store.listTableNames()).toEqual([
       'agentMessages', 'displayMessages', 'memories', 'memoryCandidates', 'sessions',
     ]);
+    store.close();
+    expect((await stat(path.dirname(databasePath))).mode & 0o777).toBe(0o755);
+    expect((await stat(databasePath)).mode & 0o777).toBe(0o600);
+  });
+
+  it('将本次新建的应用数据库目录限制为仅用户可访问', async () => {
+    const rootDatabasePath = await createDatabasePath();
+    const databasePath = path.join(path.dirname(rootDatabasePath), 'application-data', 'agent.db');
+    const store = new PersistenceStore(databasePath);
     store.close();
     expect((await stat(path.dirname(databasePath))).mode & 0o777).toBe(0o700);
     expect((await stat(databasePath)).mode & 0o777).toBe(0o600);
@@ -256,7 +266,10 @@ export const persistedAgentMessageSchema = z.discriminatedUnion('role', [
     role: z.literal('assistant'),
     content: z.string().nullable(),
     tool_calls: z.array(toolCallSchema).optional(),
-  }),
+  }).refine(
+    (message) => Boolean(message.content?.trim()) || Boolean(message.tool_calls?.length),
+    'assistant 消息必须包含有效文本或工具调用',
+  ),
   z.object({
     role: z.literal('tool'),
     tool_call_id: z.string().min(1),
@@ -369,14 +382,21 @@ export class PersistenceStore {
   /** 打开数据库、限制权限并执行顺序迁移。 */
   constructor(readonly databasePath: string) {
     const directory = path.dirname(databasePath);
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    chmodSync(directory, 0o700);
+    const createdDirectory = mkdirSync(directory, { recursive: true, mode: 0o700 });
+    if (createdDirectory !== undefined) chmodSync(directory, 0o700);
     this.database = new DatabaseSync(databasePath);
     chmodSync(databasePath, 0o600);
     this.database.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;');
-    const version = this.getSchemaVersion();
-    if (version === 0) this.database.exec(`BEGIN IMMEDIATE; ${migrationV1} COMMIT;`);
-    else if (version !== schemaVersion) throw new Error(`不支持的数据库版本：${version}`);
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const version = this.getSchemaVersion();
+      if (version === 0) this.database.exec(migrationV1);
+      else if (version !== schemaVersion) throw new Error(`不支持的数据库版本：${version}`);
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   /** 返回 SQLite Schema 版本。 */
@@ -446,7 +466,7 @@ const parsed = configSchema.safeParse({
 
 ```json
 "engines": {
-  "node": ">=22.5.0"
+  "node": ">=22.13.0"
 }
 ```
 
@@ -2272,7 +2292,7 @@ Expected: 全部通过，并证明以下不变量：
 
 同步更新：
 
-- Node 要求为 22.5+。
+- Node 要求为 22.13+。
 - 删除“服务重启后清空”“最多保留 20 个会话”“首版不包含会话持久化”。
 - 增加 Web 记忆面板说明。
 - 增加 CLI `/new`、`/sessions`、`/resume`、`/delete-session`、`/memory`。

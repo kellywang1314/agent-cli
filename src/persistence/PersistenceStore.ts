@@ -86,14 +86,30 @@ export class PersistenceStore {
     let database: DatabaseSync | undefined;
     try {
       const directory = path.dirname(databasePath);
-      mkdirSync(directory, { recursive: true, mode: 0o700 });
-      chmodSync(directory, 0o700);
+      const createdDirectory = mkdirSync(directory, { recursive: true, mode: 0o700 });
+      if (createdDirectory !== undefined) chmodSync(directory, 0o700);
       database = new DatabaseSync(databasePath);
       chmodSync(databasePath, 0o600);
       database.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;');
-      const version = Number(database.prepare('PRAGMA user_version').get()?.user_version ?? 0);
-      if (version === 0) database.exec(`BEGIN IMMEDIATE; ${migrationV1} COMMIT;`);
-      else if (version !== schemaVersion) throw new UnsupportedDatabaseVersionError(version);
+      let transactionStarted = false;
+      try {
+        database.exec('BEGIN IMMEDIATE');
+        transactionStarted = true;
+        const version = Number(database.prepare('PRAGMA user_version').get()?.user_version ?? 0);
+        if (version === 0) database.exec(migrationV1);
+        else if (version !== schemaVersion) throw new UnsupportedDatabaseVersionError(version);
+        database.exec('COMMIT');
+        transactionStarted = false;
+      } catch (error) {
+        if (transactionStarted) {
+          try {
+            database.exec('ROLLBACK');
+          } catch {
+            // 保留初始化失败，由外层统一关闭连接并报告。
+          }
+        }
+        throw error;
+      }
       this.database = database;
     } catch {
       try {
@@ -108,6 +124,15 @@ export class PersistenceStore {
   /** 返回 SQLite Schema 版本。 */
   getSchemaVersion(): number {
     return Number(this.database.prepare('PRAGMA user_version').get()?.user_version ?? 0);
+  }
+
+  /** 返回当前连接的关键 SQLite 初始化设置。 */
+  getPragmaSettings(): { journalMode: string; foreignKeys: boolean; busyTimeout: number } {
+    return {
+      journalMode: String(this.database.prepare('PRAGMA journal_mode').get()?.journal_mode ?? ''),
+      foreignKeys: Boolean(Number(this.database.prepare('PRAGMA foreign_keys').get()?.foreign_keys ?? 0)),
+      busyTimeout: Number(this.database.prepare('PRAGMA busy_timeout').get()?.timeout ?? 0),
+    };
   }
 
   /** 返回按名称排序的业务表，供迁移检查使用。 */

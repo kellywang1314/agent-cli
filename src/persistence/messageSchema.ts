@@ -18,7 +18,10 @@ export const persistedAgentMessageSchema = z.discriminatedUnion('role', [
     role: z.literal('assistant'),
     content: z.string().nullable(),
     tool_calls: z.array(toolCallSchema).optional(),
-  }),
+  }).refine(
+    (message) => Boolean(message.content?.trim()) || Boolean(message.tool_calls?.length),
+    'assistant 消息必须包含有效文本或工具调用',
+  ),
   z.strictObject({
     role: z.literal('tool'),
     tool_call_id: z.string().min(1),
