@@ -95,14 +95,13 @@ export class PersistenceStore {
       if (version === 0) database.exec(`BEGIN IMMEDIATE; ${migrationV1} COMMIT;`);
       else if (version !== schemaVersion) throw new UnsupportedDatabaseVersionError(version);
       this.database = database;
-    } catch (error) {
+    } catch {
       try {
         database?.close();
       } catch {
-        // 保留导致初始化失败的原始异常。
+        // 忽略关闭错误，保持统一的公开错误边界。
       }
-      if (error instanceof UnsupportedDatabaseVersionError) throw error;
-      throw new Error(`无法打开长期记忆数据库：${databasePath}`, { cause: error });
+      throw new Error(`无法打开长期记忆数据库：${databasePath}`);
     }
   }
 
