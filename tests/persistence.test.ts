@@ -9,6 +9,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { resolveDatabasePath } from '../src/persistence/databasePath.js';
 import { persistedAgentMessageSchema } from '../src/persistence/messageSchema.js';
 import { PersistenceStore } from '../src/persistence/PersistenceStore.js';
+import type {
+  NewDisplayMessage,
+  StoredSession,
+} from '../src/persistence/types.js';
 
 const cleanups: Array<() => Promise<void>> = [];
 const readyTimeoutMs = 5000;
@@ -41,6 +45,39 @@ async function createDatabasePath(): Promise<string> {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'agent-db-'));
   cleanups.push(() => rm(directory, { recursive: true, force: true }));
   return path.join(directory, 'agent.db');
+}
+
+/** 构造具有稳定默认值的持久化会话。 */
+function buildSession(overrides: Partial<StoredSession> = {}): StoredSession {
+  return {
+    id: 'session-1',
+    clientType: 'web',
+    workspace: '/workspace/one',
+    title: '新会话',
+    status: 'idle',
+    turns: 0,
+    memoryExtractionStatus: 'idle',
+    memoryExtractionError: null,
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  };
+}
+
+/** 构造不包含会话和序号字段的显示消息。 */
+function buildDisplayMessage(overrides: Partial<NewDisplayMessage> = {}): NewDisplayMessage {
+  return {
+    id: 'display-1',
+    role: 'user',
+    content: '用户输入',
+    createdAt: 2,
+    ...overrides,
+  };
+}
+
+/** 读取测试专用的底层数据库句柄。 */
+function getTestDatabase(store: PersistenceStore): DatabaseSync {
+  return (store as unknown as { database: DatabaseSync }).database;
 }
 
 /** 捕获构造失败，供错误边界断言复用。 */
@@ -414,6 +451,322 @@ describe('PersistenceStore schema', () => {
     } finally {
       verificationDatabase.close();
     }
+  });
+});
+
+describe('PersistenceStore session CRUD', () => {
+  it('原子写入一轮开头并按工作区和客户端隔离会话', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    const webSession = buildSession();
+    const cliSession = buildSession({
+      id: 'session-2',
+      clientType: 'cli',
+      title: 'CLI 会话',
+      updatedAt: 2,
+    });
+    store.createSession(webSession);
+    store.createSession(cliSession);
+
+    store.beginTurn(
+      webSession.id,
+      buildDisplayMessage(),
+      { role: 'user', content: '模型输入' },
+    );
+
+    expect(store.listSessions({
+      workspace: webSession.workspace,
+      clientType: 'web',
+    })).toEqual([{
+      ...webSession,
+      status: 'running',
+      turns: 1,
+    }]);
+    expect(store.loadDisplayMessages(webSession.id)).toEqual([{
+      ...buildDisplayMessage(),
+      sessionId: webSession.id,
+      sequence: 0,
+    }]);
+    expect(store.loadAgentMessages(webSession.id)).toEqual([
+      { role: 'user', content: '模型输入' },
+    ]);
+    store.close();
+  });
+
+  it('删除会话级联删除两类消息', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    const session = buildSession();
+    store.createSession(session);
+    store.beginTurn(
+      session.id,
+      buildDisplayMessage(),
+      { role: 'user', content: '模型输入' },
+    );
+
+    store.deleteSession(session.id);
+
+    expect(store.loadDisplayMessages(session.id)).toEqual([]);
+    expect(store.loadAgentMessages(session.id)).toEqual([]);
+    expect(store.listSessions()).toEqual([]);
+    store.close();
+  });
+
+  it('修复进程退出留下的运行状态和未配对工具消息', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    const session = buildSession({
+      memoryExtractionStatus: 'running',
+    });
+    store.createSession(session);
+    store.beginTurn(
+      session.id,
+      buildDisplayMessage(),
+      { role: 'user', content: '执行工具' },
+    );
+    store.appendAgentMessages(session.id, [{
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'call-1',
+        type: 'function',
+        function: { name: 'readFile', arguments: '{}' },
+      }],
+    }]);
+
+    store.recoverInterruptedWork();
+
+    expect(store.getSession(session.id)).toMatchObject({
+      status: 'interrupted',
+      memoryExtractionStatus: 'failed',
+      memoryExtractionError: '服务重启，记忆提取未完成',
+    });
+    expect(store.loadAgentMessages(session.id).at(-1)).toEqual({
+      role: 'tool',
+      tool_call_id: 'call-1',
+      content: '{"error":"服务中断，工具结果未知"}',
+    });
+    store.close();
+  });
+
+  it('事务失败不留下半写数据', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    const session = buildSession();
+    store.createSession(session);
+    getTestDatabase(store).exec(`
+      CREATE TRIGGER failAgentInsert
+      BEFORE INSERT ON agentMessages
+      BEGIN
+        SELECT RAISE(ABORT, 'forced agent insert failure');
+      END;
+    `);
+
+    expect(() => store.beginTurn(
+      session.id,
+      buildDisplayMessage(),
+      { role: 'user', content: '模型输入' },
+    )).toThrow('forced agent insert failure');
+
+    expect(store.loadDisplayMessages(session.id)).toEqual([]);
+    expect(store.loadAgentMessages(session.id)).toEqual([]);
+    expect(store.getSession(session.id)).toEqual(session);
+    store.close();
+  });
+
+  it('按 workspace 和 clientType 组合查询并稳定排序', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    const sessions = [
+      buildSession({ id: 'web-b', updatedAt: 3 }),
+      buildSession({ id: 'web-a', updatedAt: 3 }),
+      buildSession({ id: 'cli-a', clientType: 'cli', updatedAt: 4 }),
+      buildSession({ id: 'other-web', workspace: '/workspace/two', updatedAt: 5 }),
+    ];
+    sessions.forEach((session) => store.createSession(session));
+
+    expect(store.listSessions().map(({ id }) => id)).toEqual([
+      'other-web', 'cli-a', 'web-a', 'web-b',
+    ]);
+    expect(store.listSessions({ workspace: '/workspace/one' }).map(({ id }) => id)).toEqual([
+      'cli-a', 'web-a', 'web-b',
+    ]);
+    expect(store.listSessions({ clientType: 'web' }).map(({ id }) => id)).toEqual([
+      'other-web', 'web-a', 'web-b',
+    ]);
+    expect(store.listSessions({
+      workspace: '/workspace/one',
+      clientType: 'cli',
+    }).map(({ id }) => id)).toEqual(['cli-a']);
+    store.close();
+  });
+
+  it('分别维护严格递增的显示消息和 agent 消息序号', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    const session = buildSession();
+    store.createSession(session);
+    store.beginDisplayOnlyTurn(session.id, buildDisplayMessage());
+    store.appendDisplayMessage(session.id, buildDisplayMessage({
+      id: 'display-2',
+      role: 'assistant',
+      content: '第一条回复',
+      createdAt: 3,
+    }), {
+      title: '已更新',
+      updatedAt: 3,
+    });
+    store.appendDisplayMessage(session.id, buildDisplayMessage({
+      id: 'display-3',
+      role: 'notice',
+      content: '提示',
+      createdAt: 4,
+    }), {});
+    store.appendAgentMessages(session.id, [
+      { role: 'user', content: '第一条' },
+      { role: 'assistant', content: '第二条' },
+    ]);
+    store.appendAgentMessages(session.id, [
+      { role: 'tool', tool_call_id: 'call-1', content: '第三条' },
+    ]);
+
+    expect(store.loadDisplayMessages(session.id).map(({ sequence }) => sequence)).toEqual([0, 1, 2]);
+    expect(store.loadAgentMessages(session.id)).toEqual([
+      { role: 'user', content: '第一条' },
+      { role: 'assistant', content: '第二条' },
+      { role: 'tool', tool_call_id: 'call-1', content: '第三条' },
+    ]);
+    expect(getTestDatabase(store).prepare(
+      'SELECT sequence FROM agentMessages WHERE sessionId = ? ORDER BY sequence',
+    ).all(session.id).map(({ sequence }) => Number(sequence))).toEqual([0, 1, 2]);
+    expect(store.getSession(session.id)).toMatchObject({
+      title: '已更新',
+      status: 'running',
+      turns: 1,
+      updatedAt: 3,
+    });
+    store.close();
+  });
+
+  it('agent payload 写入和读取都执行严格 schema 校验', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    const session = buildSession();
+    store.createSession(session);
+
+    expect(() => store.appendAgentMessages(session.id, [{
+      role: 'assistant',
+      content: '',
+    }])).toThrow();
+    expect(store.loadAgentMessages(session.id)).toEqual([]);
+
+    getTestDatabase(store).prepare(`
+      INSERT INTO agentMessages (id, sessionId, sequence, payloadJson, createdAt)
+      VALUES (?, ?, ?, ?, ?)
+    `).run('invalid-agent', session.id, 0, '{}', 2);
+    expect(() => store.loadAgentMessages(session.id)).toThrow();
+    store.close();
+  });
+
+  it('缺失会话返回一致错误并安全处理 patch 边界', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    const session = buildSession();
+    const missingError = '会话不存在：missing';
+
+    expect(() => store.getSession('missing')).toThrow(missingError);
+    expect(() => store.beginDisplayOnlyTurn(
+      'missing',
+      buildDisplayMessage(),
+    )).toThrow(missingError);
+    expect(() => store.appendAgentMessages(
+      'missing',
+      [{ role: 'user', content: '输入' }],
+    )).toThrow(missingError);
+    expect(() => store.updateSession('missing', {})).toThrow(missingError);
+
+    store.createSession(session);
+    expect(() => store.updateSession(session.id, {})).not.toThrow();
+    expect(() => store.updateSession(
+      session.id,
+      { turns: 99 } as never,
+    )).toThrow('不支持的会话更新字段：turns');
+    expect(store.getSession(session.id)).toEqual(session);
+    store.close();
+  });
+
+  it('恢复多个会话时仅补齐后续未配对的 tool call 且重复调用幂等', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    const firstSession = buildSession({ id: 'session-1', status: 'running' });
+    const secondSession = buildSession({
+      id: 'session-2',
+      status: 'running',
+      memoryExtractionStatus: 'running',
+    });
+    store.createSession(firstSession);
+    store.createSession(secondSession);
+    store.appendAgentMessages(firstSession.id, [{
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        {
+          id: 'call-paired',
+          type: 'function',
+          function: { name: 'readFile', arguments: '{}' },
+        },
+        {
+          id: 'call-missing',
+          type: 'function',
+          function: { name: 'writeFile', arguments: '{}' },
+        },
+      ],
+    }, {
+      role: 'tool',
+      tool_call_id: 'call-paired',
+      content: '{"ok":true}',
+    }]);
+    store.appendAgentMessages(secondSession.id, [{
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'call-second',
+        type: 'function',
+        function: { name: 'search', arguments: '{}' },
+      }],
+    }]);
+
+    store.recoverInterruptedWork();
+    store.recoverInterruptedWork();
+
+    expect(store.loadAgentMessages(firstSession.id).filter(
+      (message) => message.role === 'tool',
+    )).toEqual([
+      { role: 'tool', tool_call_id: 'call-paired', content: '{"ok":true}' },
+      {
+        role: 'tool',
+        tool_call_id: 'call-missing',
+        content: '{"error":"服务中断，工具结果未知"}',
+      },
+    ]);
+    expect(store.loadAgentMessages(secondSession.id).filter(
+      (message) => message.role === 'tool',
+    )).toEqual([{
+      role: 'tool',
+      tool_call_id: 'call-second',
+      content: '{"error":"服务中断，工具结果未知"}',
+    }]);
+    expect(store.getSession(firstSession.id)).toMatchObject({
+      status: 'interrupted',
+      memoryExtractionStatus: 'idle',
+      memoryExtractionError: null,
+    });
+    expect(store.getSession(secondSession.id)).toMatchObject({
+      status: 'interrupted',
+      memoryExtractionStatus: 'failed',
+      memoryExtractionError: '服务重启，记忆提取未完成',
+    });
+    store.close();
   });
 });
 

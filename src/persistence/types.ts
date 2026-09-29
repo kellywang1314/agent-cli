@@ -20,6 +20,11 @@ export interface StoredSession {
   updatedAt: number;
 }
 
+export type SessionQuery = Partial<Pick<StoredSession, 'workspace' | 'clientType'>>;
+export type SessionPatch = Partial<Pick<StoredSession,
+  'title' | 'status' | 'memoryExtractionStatus' | 'memoryExtractionError' | 'updatedAt'
+>>;
+
 export interface StoredDisplayMessage {
   id: string;
   sessionId: string;
@@ -28,6 +33,8 @@ export interface StoredDisplayMessage {
   content: string;
   createdAt: number;
 }
+
+export type NewDisplayMessage = Omit<StoredDisplayMessage, 'sessionId' | 'sequence'>;
 
 export interface StoredAgentMessage {
   id: string;
