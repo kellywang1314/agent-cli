@@ -64,6 +64,20 @@ export class AgentLoop {
     this.messages = [];
   }
 
+  /** 检查历史中的工具调用是否均有配对结果。 */
+  private hasIncompleteToolCalls(): boolean {
+    const pendingToolCallIds = new Set<string>();
+    for (const message of this.messages) {
+      if ((message.role === 'user' || message.role === 'assistant') && pendingToolCallIds.size > 0) return true;
+      if (message.role === 'assistant') {
+        for (const toolCall of message.tool_calls ?? []) pendingToolCallIds.add(toolCall.id);
+      } else if (message.role === 'tool') {
+        pendingToolCallIds.delete(message.tool_call_id);
+      }
+    }
+    return pendingToolCallIds.size > 0;
+  }
+
   /** 先可靠持久化，再更新内存历史，避免模型看到无法恢复的消息。 */
   private async appendMessages(messages: ChatCompletionMessageParam[]): Promise<void> {
     await this.options.onMessagesAppended?.(structuredClone(messages));
@@ -92,6 +106,7 @@ export class AgentLoop {
     if (this.busy) throw new Error('已有任务运行中');
     if (!prompt.trim()) throw new Error('请输入任务');
     context.signal.throwIfAborted();
+    if (this.hasIncompleteToolCalls()) throw new Error('会话历史包含未完成的工具调用，请新建会话');
     this.busy = true;
     const signatures = new Map<string, number>();
     try {
@@ -106,7 +121,7 @@ export class AgentLoop {
           await this.appendMessages([{ role: 'assistant', content: reply.content }]);
           return reply.content;
         }
-        if (reply.toolCalls.length > 16) return this.finish('单轮工具调用超过 16 个，已停止，请拆分任务。');
+        if (reply.toolCalls.length > 16) return await this.finish('单轮工具调用超过 16 个，已停止，请拆分任务。');
         await this.appendMessages([{
           role: 'assistant',
           content: reply.content || null,
@@ -147,9 +162,9 @@ export class AgentLoop {
           this.options.onEvent?.({ type: 'toolEnd', name: call.name, result: content, elapsedMs: Date.now() - startedAt });
         }
         context.signal.throwIfAborted();
-        if (repeated) return this.finish('检测到重复调用，任务已停止。请补充信息或调整目标后继续。');
+        if (repeated) return await this.finish('检测到重复调用，任务已停止。请补充信息或调整目标后继续。');
       }
-      return this.finish(`已达到 ${this.options.maxRounds} 轮次上限。已保留执行结果，可输入新指令继续。`);
+      return await this.finish(`已达到 ${this.options.maxRounds} 轮次上限。已保留执行结果，可输入新指令继续。`);
     } finally {
       this.busy = false;
     }

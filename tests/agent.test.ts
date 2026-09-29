@@ -114,6 +114,56 @@ describe('AgentLoop', () => {
     expect(agent.getConversationMessages()).toEqual([]);
   });
 
+  it('工具结果持久化失败后拒绝继续使用不完整历史，清空后可恢复', async () => {
+    const snapshots: ChatCompletionMessageParam[][] = [];
+    const persistenceError = new Error('数据库错误');
+    let failToolBatch = true;
+    const provider = createProvider([
+      { content: '', toolCalls: [{ id: '1', name: 'readFile', arguments: '{}' }] },
+      { content: '恢复完成', toolCalls: [] },
+    ], snapshots);
+    const agent = new AgentLoop(provider, createExecutor(async () => '结果'), {
+      systemPrompt: '规则',
+      maxRounds: 2,
+      onMessagesAppended: async (messages) => {
+        if (failToolBatch && messages.every((message) => message.role === 'tool')) {
+          failToolBatch = false;
+          throw persistenceError;
+        }
+      },
+    });
+
+    await expect(agent.run('首次任务', createContext(provider))).rejects.toBe(persistenceError);
+    await expect(agent.run('不应追加', createContext(provider)))
+      .rejects.toThrow('会话历史包含未完成的工具调用，请新建会话');
+    expect(snapshots).toHaveLength(1);
+    expect(agent.getConversationMessages()).not.toContainEqual({ role: 'user', content: '不应追加' });
+
+    agent.clear();
+    expect(await agent.run('恢复任务', createContext(provider))).toBe('恢复完成');
+    expect(snapshots).toHaveLength(2);
+  });
+
+  it('初始历史包含未配对工具调用时在请求模型前拒绝运行', async () => {
+    const snapshots: ChatCompletionMessageParam[][] = [];
+    const initialMessages: ChatCompletionMessageParam[] = [{
+      role: 'assistant',
+      content: null,
+      tool_calls: [{ id: 'pending', type: 'function', function: { name: 'readFile', arguments: '{}' } }],
+    }];
+    const provider = createProvider([{ content: '不应调用', toolCalls: [] }], snapshots);
+    const agent = new AgentLoop(provider, createExecutor(async () => null), {
+      systemPrompt: '规则',
+      maxRounds: 1,
+      initialMessages,
+    });
+
+    await expect(agent.run('不应追加', createContext(provider)))
+      .rejects.toThrow('会话历史包含未完成的工具调用，请新建会话');
+    expect(snapshots).toHaveLength(0);
+    expect(agent.getConversationMessages()).toEqual(initialMessages);
+  });
+
   it('无效工具参数作为错误观察，模型可以修正', async () => {
     const snapshots: ChatCompletionMessageParam[][] = [];
     const provider = createProvider([
@@ -174,6 +224,49 @@ describe('AgentLoop', () => {
     agent.clear();
     expect(agent.getMessages()).toEqual([{ role: 'system', content: '规则' }]);
     expect(agent.getConversationMessages()).toEqual([]);
+  });
+
+  it('循环终止消息持久化完成前保持运行中状态', async () => {
+    let resolveFinish: (() => void) | undefined;
+    let markFinishStarted: (() => void) | undefined;
+    let shouldDelayFinish = true;
+    const finishStarted = new Promise<void>((resolve) => { markFinishStarted = resolve; });
+    const provider = createProvider([
+      { content: '', toolCalls: [{ id: '1', name: 'readFile', arguments: '{}' }] },
+      { content: '不应并发执行', toolCalls: [] },
+    ]);
+    const agent = new AgentLoop(provider, createExecutor(async () => '结果'), {
+      systemPrompt: '规则',
+      maxRounds: 1,
+      onMessagesAppended: async (messages) => {
+        const message = messages[0];
+        if (shouldDelayFinish && messages.length === 1 && message?.role === 'assistant' && !message.tool_calls) {
+          shouldDelayFinish = false;
+          markFinishStarted?.();
+          await new Promise<void>((resolve) => { resolveFinish = resolve; });
+        }
+      },
+    });
+    const running = agent.run('任务', createContext(provider));
+
+    await finishStarted;
+    let clearError: unknown;
+    let runError: unknown;
+    try {
+      agent.clear();
+    } catch (error) {
+      clearError = error;
+    }
+    try {
+      await agent.run('并发任务', createContext(provider));
+    } catch (error) {
+      runError = error;
+    }
+    resolveFinish?.();
+    await running;
+
+    expect(clearError).toMatchObject({ message: '请先中断当前任务' });
+    expect(runError).toMatchObject({ message: '已有任务运行中' });
   });
 
   it('最大轮次和重复调用检测阻止无限工具执行', async () => {
