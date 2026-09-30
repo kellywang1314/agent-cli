@@ -928,6 +928,117 @@ describe('PersistenceStore memory transactions', () => {
     store.close();
   });
 
+  it('一次查询返回工作区全部非 ignored 候选去重键并隔离其他工作区', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    store.createSession(buildSession());
+    store.createSession(buildSession({
+      id: 'session-2',
+      updatedAt: 2,
+    }));
+    store.createSession(buildSession({
+      id: 'session-3',
+      workspace: '/workspace/two',
+      updatedAt: 3,
+    }));
+    store.insertMemoryCandidates([
+      buildMemoryCandidate(),
+      buildMemoryCandidate({
+        id: 'candidate-2',
+        sourceSessionId: 'session-2',
+        content: '第二条候选',
+        normalizedContent: '第二条候选',
+        status: 'accepted',
+        createdAt: 11,
+      }),
+      buildMemoryCandidate({
+        id: 'candidate-ignored',
+        sourceSessionId: 'session-2',
+        content: '已忽略候选',
+        normalizedContent: '已忽略候选',
+        status: 'ignored',
+        createdAt: 12,
+      }),
+      buildMemoryCandidate({
+        id: 'candidate-other',
+        workspace: '/workspace/two',
+        sourceSessionId: 'session-3',
+        content: '其他工作区候选',
+        normalizedContent: '其他工作区候选',
+        createdAt: 13,
+      }),
+    ]);
+
+    expect(store.listNonIgnoredMemoryCandidateNormalizedContents('/workspace/one'))
+      .toEqual(['使用 react 19', '第二条候选']);
+    store.close();
+  });
+
+  it('一次查询返回工作区全部正式记忆去重键且包含停用项', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    store.createSession(buildSession());
+    store.createSession(buildSession({
+      id: 'session-2',
+      workspace: '/workspace/two',
+      updatedAt: 2,
+    }));
+    store.insertMemoryCandidates([
+      buildMemoryCandidate(),
+      buildMemoryCandidate({
+        id: 'candidate-other',
+        workspace: '/workspace/two',
+        sourceSessionId: 'session-2',
+        content: '其他工作区记忆',
+        normalizedContent: '其他工作区记忆',
+        createdAt: 11,
+      }),
+    ]);
+    const memory = store.resolveMemoryCandidate('session-1', 'candidate-1', {
+      action: 'accept',
+      content: '使用 React 19',
+      normalizedContent: '使用 react 19',
+    }, 20);
+    store.resolveMemoryCandidate('session-2', 'candidate-other', {
+      action: 'accept',
+      content: '其他工作区记忆',
+      normalizedContent: '其他工作区记忆',
+    }, 21);
+    store.updateMemory('session-1', memory!.id, { active: false });
+
+    expect(store.listMemoryNormalizedContents('/workspace/one'))
+      .toEqual(['使用 react 19']);
+    store.close();
+  });
+
+  it('listMemories 将安全正整数 limit 下推并拒绝无效值', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    store.createSession(buildSession());
+    const candidates = Array.from({ length: 3 }, (_, index) => buildMemoryCandidate({
+      id: `candidate-${index}`,
+      content: `记忆-${index}`,
+      normalizedContent: `记忆-${index}`,
+      createdAt: index + 10,
+    }));
+    store.insertMemoryCandidates(candidates);
+    candidates.forEach((candidate, index) => {
+      store.resolveMemoryCandidate('session-1', candidate.id, {
+        action: 'accept',
+        content: candidate.content,
+        normalizedContent: candidate.normalizedContent,
+      }, index + 20);
+    });
+
+    expect(store.listMemories('/workspace/one', true, 2).map(({ content }) => content))
+      .toEqual(['记忆-2', '记忆-1']);
+    for (const limit of [0, -1, 1.5, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => store.listMemories('/workspace/one', false, limit))
+        .toThrow('记忆查询条数限制必须是安全正整数');
+    }
+    store.close();
+  });
+
   it('空候选批次也会原子完成提取并清空旧错误', async () => {
     const databasePath = await createDatabasePath();
     const store = new PersistenceStore(databasePath);

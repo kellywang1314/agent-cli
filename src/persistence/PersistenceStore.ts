@@ -589,15 +589,41 @@ export class PersistenceStore {
     `).all(...values).map(mapMemoryCandidate);
   }
 
+  /** 列出工作区全部非忽略候选的去重键。 */
+  listNonIgnoredMemoryCandidateNormalizedContents(workspace: string): string[] {
+    return this.database.prepare(`
+      SELECT normalizedContent
+      FROM memoryCandidates
+      WHERE workspace = ? AND status != ?
+      ORDER BY createdAt ASC, id ASC
+    `).all(workspace, 'ignored').map((row) => String(row.normalizedContent));
+  }
+
+  /** 列出工作区全部正式记忆的去重键。 */
+  listMemoryNormalizedContents(workspace: string): string[] {
+    return this.database.prepare(`
+      SELECT normalizedContent
+      FROM memories
+      WHERE workspace = ?
+      ORDER BY updatedAt DESC, id ASC
+    `).all(workspace).map((row) => String(row.normalizedContent));
+  }
+
   /** 列出工作区正式记忆，默认包含停用项并保持稳定更新时间排序。 */
-  listMemories(workspace: string, activeOnly = false): StoredMemory[] {
+  listMemories(workspace: string, activeOnly = false, limit?: number): StoredMemory[] {
+    if (limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0)) {
+      throw new Error('记忆查询条数限制必须是安全正整数');
+    }
     const activeCondition = activeOnly ? ' AND active = ?' : '';
     const values: Array<string | number> = activeOnly ? [workspace, 1] : [workspace];
+    const limitClause = limit === undefined ? '' : ' LIMIT ?';
+    if (limit !== undefined) values.push(limit);
     return this.database.prepare(`
       SELECT *
       FROM memories
       WHERE workspace = ?${activeCondition}
       ORDER BY updatedAt DESC, id ASC
+      ${limitClause}
     `).all(...values).map(mapMemory);
   }
 

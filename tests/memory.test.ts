@@ -23,12 +23,29 @@ import type { ChatReply, ModelProvider } from '../src/providers/types.js';
 const cleanups: Array<() => Promise<void>> = [];
 const stores: PersistenceStore[] = [];
 
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason: unknown) => void;
+}
+
 /** 关闭测试数据库并清理临时目录。 */
 afterEach(async () => {
   vi.restoreAllMocks();
   for (const store of stores.splice(0).reverse()) store.close();
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
+
+/** 创建可由测试精确控制完成顺序的 Promise。 */
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
 
 /** 创建具有稳定默认值的会话。 */
 function buildSession(overrides: Partial<StoredSession> = {}): StoredSession {
@@ -118,6 +135,16 @@ function acceptCandidate(
     content: candidate.content,
     normalizedContent: candidate.normalizedContent,
   }, resolvedAt);
+}
+
+/** 从提取提示词中读取已有记忆数组。 */
+function readExistingMemoriesFromPrompt(prompt: string): string[] {
+  const prefix = '已有已确认记忆：\n';
+  const suffix = '\n\n本轮上下文：';
+  const start = prompt.indexOf(prefix);
+  const end = prompt.indexOf(suffix, start + prefix.length);
+  if (start < 0 || end < 0) throw new Error('提取提示词缺少已有记忆区段');
+  return JSON.parse(prompt.slice(start + prefix.length, end)) as string[];
 }
 
 describe('记忆提取与提示词', () => {
@@ -227,6 +254,143 @@ describe('记忆提取与提示词', () => {
     });
   });
 
+  it('同一会话严格串行提取，前次失败后继续并由后次写入最终状态', async () => {
+    const store = await createStore();
+    store.createSession(buildSession());
+    const firstReply = createDeferred<ChatReply>();
+    const secondReply = createDeferred<ChatReply>();
+    let activeCalls = 0;
+    let maxActiveCalls = 0;
+    let callIndex = 0;
+    const provider = createProvider(async () => {
+      const currentCall = callIndex;
+      callIndex += 1;
+      activeCalls += 1;
+      maxActiveCalls = Math.max(maxActiveCalls, activeCalls);
+      try {
+        return await (currentCall === 0 ? firstReply.promise : secondReply.promise);
+      } finally {
+        activeCalls -= 1;
+      }
+    });
+    const service = new MemoryService(store, provider, (text) => text);
+    const updateSession = vi.spyOn(store, 'updateSession');
+
+    const firstExtraction = service.extractTurn(buildExtractionInput({ sourceTurn: 1 }));
+    void firstExtraction.catch(() => undefined);
+    const secondExtraction = service.extractTurn(buildExtractionInput({ sourceTurn: 2 }));
+    secondReply.resolve({
+      content: JSON.stringify({
+        candidates: [{ category: 'decision', content: '第二次提取结果' }],
+      }),
+      toolCalls: [],
+    });
+    await vi.waitFor(() => expect(provider.chat).toHaveBeenCalledTimes(1));
+    expect(updateSession).toHaveBeenCalledTimes(1);
+    expect(updateSession).toHaveBeenLastCalledWith('session-1', {
+      memoryExtractionStatus: 'running',
+      memoryExtractionError: null,
+    });
+    firstReply.reject(new Error('第一次失败'));
+
+    await expect(firstExtraction).rejects.toThrow('第一次失败');
+    await expect(secondExtraction).resolves.toMatchObject([{
+      sourceTurn: 2,
+      content: '第二次提取结果',
+    }]);
+    expect(maxActiveCalls).toBe(1);
+    expect(store.getSession('session-1')).toMatchObject({
+      memoryExtractionStatus: 'complete',
+      memoryExtractionError: null,
+    });
+    expect((service as unknown as {
+      extractionQueues: Map<string, Promise<void>>;
+    }).extractionQueues.size).toBe(0);
+  });
+
+  it('不同会话的提取可并发执行', async () => {
+    const store = await createStore();
+    store.createSession(buildSession());
+    store.createSession(buildSession({ id: 'session-2', updatedAt: 2 }));
+    const replies = [createDeferred<ChatReply>(), createDeferred<ChatReply>()];
+    let activeCalls = 0;
+    let maxActiveCalls = 0;
+    let callIndex = 0;
+    const provider = createProvider(async () => {
+      const currentCall = callIndex;
+      callIndex += 1;
+      activeCalls += 1;
+      maxActiveCalls = Math.max(maxActiveCalls, activeCalls);
+      try {
+        return await replies[currentCall]!.promise;
+      } finally {
+        activeCalls -= 1;
+      }
+    });
+    const service = new MemoryService(store, provider, (text) => text);
+
+    const firstExtraction = service.extractTurn(buildExtractionInput());
+    const secondExtraction = service.extractTurn(buildExtractionInput({
+      sessionId: 'session-2',
+    }));
+    await vi.waitFor(() => expect(provider.chat).toHaveBeenCalledTimes(2));
+    replies[0]!.resolve({ content: '{"candidates":[]}', toolCalls: [] });
+    replies[1]!.resolve({ content: '{"candidates":[]}', toolCalls: [] });
+
+    await Promise.all([firstExtraction, secondExtraction]);
+    expect(maxActiveCalls).toBe(2);
+  });
+
+  it('同一会话后续提取基于前次完成后的快照去重', async () => {
+    const store = await createStore();
+    store.createSession(buildSession());
+    const replies = [createDeferred<ChatReply>(), createDeferred<ChatReply>()];
+    let callIndex = 0;
+    const provider = createProvider(async () => replies[callIndex++]!.promise);
+    const service = new MemoryService(store, provider, (text) => text);
+    const duplicateReply = {
+      content: JSON.stringify({
+        candidates: [{ category: 'rule', content: '仅保留一条候选' }],
+      }),
+      toolCalls: [],
+    };
+
+    const firstExtraction = service.extractTurn(buildExtractionInput({ sourceTurn: 1 }));
+    const secondExtraction = service.extractTurn(buildExtractionInput({ sourceTurn: 2 }));
+    await vi.waitFor(() => expect(provider.chat).toHaveBeenCalledTimes(1));
+    replies[0]!.resolve(duplicateReply);
+    await firstExtraction;
+    await vi.waitFor(() => expect(provider.chat).toHaveBeenCalledTimes(2));
+    replies[1]!.resolve(duplicateReply);
+
+    await expect(secondExtraction).resolves.toEqual([]);
+    expect(store.listMemoryCandidates('session-1', 'pending')).toHaveLength(1);
+  });
+
+  it('排队等待期间取消时不调用 Provider', async () => {
+    const store = await createStore();
+    store.createSession(buildSession());
+    const firstReply = createDeferred<ChatReply>();
+    const provider = createProvider(async () => firstReply.promise);
+    const service = new MemoryService(store, provider, (text) => text);
+    const abortController = new AbortController();
+
+    const firstExtraction = service.extractTurn(buildExtractionInput({ sourceTurn: 1 }));
+    const secondExtraction = service.extractTurn(buildExtractionInput({
+      sourceTurn: 2,
+      signal: abortController.signal,
+    }));
+    void secondExtraction.catch(() => undefined);
+    await vi.waitFor(() => expect(provider.chat).toHaveBeenCalledTimes(1));
+    abortController.abort();
+    firstReply.resolve({ content: '{"candidates":[]}', toolCalls: [] });
+
+    await firstExtraction;
+    await expect(secondExtraction).rejects.toMatchObject({ name: 'AbortError' });
+    expect(provider.chat).toHaveBeenCalledTimes(1);
+    expect(store.getSession('session-1').memoryExtractionStatus).toBe('complete');
+  });
+
   it('跳过常见凭据和同工作区重复内容，但不跨工作区去重', async () => {
     const store = await createStore();
     store.createSession(buildSession());
@@ -265,6 +429,27 @@ describe('记忆提取与提示词', () => {
     ]);
     expect(store.listMemoryCandidates('session-1').map(({ id }) => id))
       .toContain('existing-candidate');
+  });
+
+  it('提取阶段过滤 GitHub、Slack 和 JWT 凭据', async () => {
+    const store = await createStore();
+    store.createSession(buildSession());
+    const provider = createProvider(JSON.stringify({
+      candidates: [
+        { category: 'fact', content: 'ghp_1234567890abcdefghijklmnopqrstuvwxyz' },
+        { category: 'fact', content: 'github_pat_11AA22BB33_ccccdddd1111222233334444' },
+        { category: 'fact', content: ['xox', 'b-test-token-1234567890'].join('') },
+        { category: 'fact', content: ['xox', 'p-test-token-1234567890'].join('') },
+        {
+          category: 'fact',
+          content: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature_123',
+        },
+      ],
+    }));
+    const service = new MemoryService(store, provider, (text) => text);
+
+    await expect(service.extractTurn(buildExtractionInput())).resolves.toEqual([]);
+    expect(store.listMemoryCandidates('session-1')).toEqual([]);
   });
 
   it('忽略候选后再次提取相同内容会重新产生待处理候选', async () => {
@@ -308,6 +493,49 @@ describe('记忆提取与提示词', () => {
     expect(candidates).toEqual([]);
     const messages = vi.mocked(provider.chat).mock.calls[0]?.[0] ?? [];
     expect(String(messages[0]?.content)).not.toContain('已有已确认记忆：\n["使用 React 19"]');
+  });
+
+  it('提取提示仅加载最近五十条 active 记忆并按 12 KiB 整条截断，去重仍覆盖全量', async () => {
+    const store = await createStore();
+    store.createSession(buildSession());
+    const candidates = Array.from({ length: 55 }, (_, index) => {
+      const content = `历史记忆-${index.toString().padStart(2, '0')}-${'界'.repeat(450)}`;
+      return buildCandidate({
+        id: `history-candidate-${index}`,
+        content,
+        normalizedContent: normalizeMemoryContent(content),
+        createdAt: index + 10,
+      });
+    });
+    store.insertMemoryCandidates(candidates);
+    candidates.forEach((candidate, index) => {
+      store.resolveMemoryCandidate('session-1', candidate.id, {
+        action: 'accept',
+        content: candidate.content,
+        normalizedContent: candidate.normalizedContent,
+      }, index + 100);
+    });
+    const provider = createProvider(JSON.stringify({
+      candidates: [{ category: 'rule', content: candidates[0]!.content }],
+    }));
+    const listSessions = vi.spyOn(store, 'listSessions');
+    const listMemoryCandidates = vi.spyOn(store, 'listMemoryCandidates');
+    const service = new MemoryService(store, provider, (text) => text);
+
+    await expect(service.extractTurn(buildExtractionInput())).resolves.toEqual([]);
+
+    const messages = vi.mocked(provider.chat).mock.calls[0]?.[0] ?? [];
+    const existingMemories = readExistingMemoriesFromPrompt(String(messages[0]?.content));
+    expect(existingMemories.length).toBeLessThanOrEqual(50);
+    expect(Buffer.byteLength(JSON.stringify(existingMemories), 'utf8'))
+      .toBeLessThanOrEqual(12 * 1024);
+    expect(existingMemories).toContain(candidates[54]!.content);
+    expect(existingMemories).not.toContain(candidates[0]!.content);
+    expect(existingMemories.every((content) => candidates.some(
+      (candidate) => candidate.content === content,
+    ))).toBe(true);
+    expect(listSessions).not.toHaveBeenCalled();
+    expect(listMemoryCandidates).not.toHaveBeenCalled();
   });
 
   it('校验提取工作区必须与会话一致', async () => {
@@ -492,6 +720,11 @@ describe('候选确认与正式记忆', () => {
     'Bearer abcdefghijklmnop',
     'sk-12345678901234567890',
     'AK-12345678901234567890',
+    'ghp_1234567890abcdefghijklmnopqrstuvwxyz',
+    'github_pat_11AA22BB33_ccccdddd1111222233334444',
+    ['xox', 'b-test-token-1234567890'].join(''),
+    ['xox', 'p-test-token-1234567890'].join(''),
+    'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature_123',
   ])('拒绝候选接受和正式编辑中的潜在凭据：%s', async (secret) => {
     const store = await createStore();
     store.createSession(buildSession());
@@ -515,6 +748,14 @@ describe('候选确认与正式记忆', () => {
     );
     expect(() => service.updateMemory('session-1', memory!.id, { content: secret }))
       .toThrow('记忆内容包含潜在敏感信息');
+  });
+
+  it.each([
+    '3baa3b3495f03706d4c8f3e83766b77b04494364',
+    '550e8400-e29b-41d4-a716-446655440000',
+    'build_01HZX4F7Q2M8N6C3V9K1',
+  ])('不把普通代码哈希、UUID 或构建 ID 误判为凭据：%s', (content) => {
+    expect(containsPotentialSecret(content)).toBe(false);
   });
 
   it('编辑、停用、恢复和删除正式记忆，并锁定空 patch 为拒绝', async () => {
@@ -635,9 +876,11 @@ describe('运行时记忆注入', () => {
     ));
     service.updateMemory('session-1', memories[54]!.id, { active: false });
 
+    const listMemories = vi.spyOn(store, 'listMemories');
     const instructions = await service.buildRuntimeInstructions('/workspace/one');
     const included = candidates.filter(({ content }) => instructions.includes(content));
 
+    expect(listMemories).toHaveBeenCalledWith('/workspace/one', true, 50);
     expect(Buffer.byteLength(instructions, 'utf8')).toBeLessThanOrEqual(12 * 1024);
     expect(included).toHaveLength(50);
     expect(instructions).not.toContain(candidates[54]!.content);

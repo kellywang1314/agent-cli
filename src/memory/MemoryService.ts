@@ -15,6 +15,8 @@ import type {
 
 const maxRuntimeMemoryCount = 50;
 const maxRuntimeInstructionBytes = 12 * 1024;
+const maxExtractionMemoryCount = 50;
+const maxExtractionMemoryBytes = 12 * 1024;
 const maxExtractionErrorBytes = 512;
 const extractionSchema = z.object({
   candidates: z.array(z.object({
@@ -57,11 +59,24 @@ export function normalizeMemoryContent(content: string): string {
 
 /** 拒绝不应进入长期存储的常见凭据。 */
 export function containsPotentialSecret(content: string): boolean {
-  return /-----BEGIN [A-Z ]*PRIVATE KEY-----|Bearer\s+\S{16,}|(?:sk|ak)-[A-Za-z0-9_-]{20,}/i
+  return /-----BEGIN [A-Z ]*PRIVATE KEY-----|Bearer\s+\S{16,}|(?:sk|ak)-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[a-z]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/i
     .test(content);
 }
 
+/** 在 JSON UTF-8 上限内选择完整记忆，不截断任何单条内容。 */
+function selectExtractionMemories(contents: string[]): string[] {
+  const selected: string[] = [];
+  for (const content of contents) {
+    const next = [...selected, content];
+    if (Buffer.byteLength(JSON.stringify(next), 'utf8') > maxExtractionMemoryBytes) break;
+    selected.push(content);
+  }
+  return selected;
+}
+
 export class MemoryService {
+  private readonly extractionQueues = new Map<string, Promise<void>>();
+
   /** 创建使用共享数据库和模型 Provider 的记忆服务。 */
   constructor(
     private readonly store: PersistenceStore,
@@ -102,8 +117,8 @@ export class MemoryService {
     throw new Error(`记忆候选不存在：${candidateId}`);
   }
 
-  /** 提取、严格校验并持久化本轮候选。 */
-  async extractTurn(input: MemoryExtractionInput): Promise<StoredMemoryCandidate[]> {
+  /** 实际提取、严格校验并持久化本轮候选。 */
+  private async extractTurnNow(input: MemoryExtractionInput): Promise<StoredMemoryCandidate[]> {
     const session = this.store.getSession(input.sessionId);
     if (session.workspace !== input.workspace) throw new Error('会话工作区不匹配');
     this.store.updateSession(input.sessionId, {
@@ -112,10 +127,13 @@ export class MemoryService {
     });
 
     try {
-      const allMemories = this.store.listMemories(input.workspace);
-      const activeMemories = allMemories.filter(({ active }) => active);
+      const activeMemories = this.store.listMemories(
+        input.workspace,
+        true,
+        maxExtractionMemoryCount,
+      );
       const prompt = createMemoryExtractionPrompt(
-        activeMemories.map(({ content }) => content),
+        selectExtractionMemories(activeMemories.map(({ content }) => content)),
         {
           workspace: input.workspace,
           sessionId: input.sessionId,
@@ -140,13 +158,13 @@ export class MemoryService {
         throw new MemoryExtractionFormatError();
       }
 
-      const knownContent = new Set(allMemories.map(({ normalizedContent }) => (
-        normalizedContent
-      )));
-      for (const workspaceSession of this.store.listSessions({ workspace: input.workspace })) {
-        for (const candidate of this.store.listMemoryCandidates(workspaceSession.id)) {
-          if (candidate.status !== 'ignored') knownContent.add(candidate.normalizedContent);
-        }
+      const knownContent = new Set(
+        this.store.listMemoryNormalizedContents(input.workspace),
+      );
+      for (const normalizedContent of (
+        this.store.listNonIgnoredMemoryCandidateNormalizedContents(input.workspace)
+      )) {
+        knownContent.add(normalizedContent);
       }
 
       const createdAt = Date.now();
@@ -186,13 +204,31 @@ export class MemoryService {
     }
   }
 
+  /** 按会话串行执行提取，并在队列完成后释放会话槽位。 */
+  async extractTurn(input: MemoryExtractionInput): Promise<StoredMemoryCandidate[]> {
+    const previous = this.extractionQueues.get(input.sessionId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.extractionQueues.set(input.sessionId, current);
+
+    try {
+      await previous;
+      input.signal.throwIfAborted();
+      return await this.extractTurnNow(input);
+    } finally {
+      release();
+      if (this.extractionQueues.get(input.sessionId) === current) {
+        this.extractionQueues.delete(input.sessionId);
+      }
+    }
+  }
+
   /** 返回当前工作区不超过 50 条和 12 KiB 的动态系统上下文。 */
   async buildRuntimeInstructions(workspace: string): Promise<string> {
     const selected: StoredMemory[] = [];
-    for (const memory of this.store.listMemories(workspace, true).slice(
-      0,
-      maxRuntimeMemoryCount,
-    )) {
+    for (const memory of this.store.listMemories(workspace, true, maxRuntimeMemoryCount)) {
       const nextPrompt = createMemorySystemPrompt([...selected, memory]);
       if (Buffer.byteLength(nextPrompt, 'utf8') > maxRuntimeInstructionBytes) break;
       selected.push(memory);
