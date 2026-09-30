@@ -272,6 +272,76 @@ it('同一会话运行期间拒绝并发执行和删除，并在结束后释放'
   expect(() => service.remove(sessionId)).not.toThrow();
 });
 
+it('重试时跳过最后一轮不完整普通任务且不混入该轮工具结果', async () => {
+  let taskCall = 0;
+  const provider = createSessionProvider(async () => {
+    taskCall++;
+    if (taskCall === 1) {
+      return {
+        content: '',
+        toolCalls: [{ id: 'call-1', name: 'firstTool', arguments: '{}' }],
+      };
+    }
+    if (taskCall === 2) return { content: '第一轮完成', toolCalls: [] };
+    if (taskCall === 3) {
+      return {
+        content: '失败轮过程文本',
+        toolCalls: [{ id: 'call-2', name: 'failedTool', arguments: '{}' }],
+      };
+    }
+    throw new Error('最终回复失败');
+  });
+  const tools: ToolExecutor = {
+    getDefinitions: () => [],
+    execute: async (name) => ({ result: name }),
+  };
+  const { service, memoryService, sessionId, hooks } = await setupSessionTest(provider, tools);
+  await (await service.run(
+    sessionId, '第一轮', hooks, new AbortController().signal,
+  )).memoryExtraction;
+  await expect(service.run(
+    sessionId, '失败轮', hooks, new AbortController().signal,
+  )).rejects.toThrow('最终回复失败');
+  const extraction = vi.spyOn(memoryService, 'extractTurn').mockResolvedValue([]);
+
+  await expect(service.retryMemoryExtraction(
+    sessionId, new AbortController().signal,
+  )).resolves.toEqual([]);
+
+  expect(extraction).toHaveBeenCalledWith(expect.objectContaining({
+    sessionId,
+    sourceTurn: 1,
+    userPrompt: '第一轮',
+    assistantResponse: '第一轮完成',
+    toolResults: ['{"result":"firstTool"}'],
+  }));
+});
+
+it('普通任务后执行图片任务仍使用普通任务的真实轮次重试提取', async () => {
+  const provider = createSessionProvider(async () => ({ content: '普通任务完成', toolCalls: [] }));
+  const tools: ToolExecutor = {
+    getDefinitions: () => [],
+    execute: async () => ({ path: 'generated/test.png' }),
+  };
+  const { service, memoryService, sessionId, hooks } = await setupSessionTest(provider, tools);
+  await (await service.run(
+    sessionId, '普通任务', hooks, new AbortController().signal,
+  )).memoryExtraction;
+  await service.run(sessionId, '/image test', hooks, new AbortController().signal);
+  const extraction = vi.spyOn(memoryService, 'extractTurn').mockResolvedValue([]);
+
+  await expect(service.retryMemoryExtraction(
+    sessionId, new AbortController().signal,
+  )).resolves.toEqual([]);
+
+  expect(extraction).toHaveBeenCalledWith(expect.objectContaining({
+    sessionId,
+    sourceTurn: 1,
+    userPrompt: '普通任务',
+    assistantResponse: '普通任务完成',
+  }));
+});
+
 it('重试时使用最后一轮已持久化内容并由 close 等待提取任务', async () => {
   const provider = createSessionProvider(async () => ({ content: '完成', toolCalls: [] }));
   const tools: ToolExecutor = { getDefinitions: () => [], execute: async () => 'ok' };

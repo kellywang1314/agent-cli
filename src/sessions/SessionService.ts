@@ -329,42 +329,64 @@ export class SessionService {
     if (this.running.has(id)) throw new Error('已有任务正在执行');
     const session = this.persistence.getSession(id);
     const messages = this.persistence.loadAgentMessages(id);
-    let userIndex = -1;
-    for (let index = messages.length - 1; index >= 0; index--) {
-      if (messages[index]?.role === 'user' && typeof messages[index].content === 'string') {
-        userIndex = index;
+    const userIndexes = messages.flatMap((message, index) => (
+      message.role === 'user' && typeof message.content === 'string' ? [index] : []
+    ));
+    let selectedTurn: {
+      agentTurn: number;
+      userPrompt: string;
+      assistantResponse: string;
+      toolResults: string[];
+    } | undefined;
+    for (let turnIndex = userIndexes.length - 1; turnIndex >= 0; turnIndex--) {
+      const userIndex = userIndexes[turnIndex]!;
+      const nextUserIndex = userIndexes[turnIndex + 1] ?? messages.length;
+      const turnMessages = messages.slice(userIndex, nextUserIndex);
+      const userMessage = turnMessages[0];
+      const assistantMessage = turnMessages.at(-1);
+      if (
+        userMessage?.role !== 'user' ||
+        typeof userMessage.content !== 'string' ||
+        assistantMessage?.role !== 'assistant' ||
+        typeof assistantMessage.content !== 'string' ||
+        assistantMessage.tool_calls?.length
+      ) {
+        continue;
+      }
+      selectedTurn = {
+        agentTurn: turnIndex + 1,
+        userPrompt: userMessage.content,
+        assistantResponse: assistantMessage.content,
+        toolResults: turnMessages
+          .filter((message) => message.role === 'tool' && typeof message.content === 'string')
+          .map((message) => message.content as string),
+      };
+      break;
+    }
+    if (!selectedTurn) throw new Error('会话没有可重试的完整普通任务');
+
+    const displayTurns = this.persistence.loadDisplayMessages(id)
+      .filter((message) => message.role === 'user');
+    let ordinaryTurn = 0;
+    let sourceTurn: number | undefined;
+    for (const [turnIndex, message] of displayTurns.entries()) {
+      if (!message.content.startsWith('/image ')) {
+        ordinaryTurn++;
+      }
+      if (ordinaryTurn === selectedTurn.agentTurn) {
+        sourceTurn = turnIndex + 1;
         break;
       }
     }
-    if (userIndex < 0) throw new Error('会话没有可重试的普通任务');
-    const turnMessages = messages.slice(userIndex);
-    const userMessage = turnMessages[0];
-    let assistantResponse: string | undefined;
-    for (let index = turnMessages.length - 1; index >= 1; index--) {
-      const message = turnMessages[index];
-      if (message?.role === 'assistant' && typeof message.content === 'string') {
-        assistantResponse = message.content;
-        break;
-      }
-    }
-    if (
-      !userMessage ||
-      userMessage.role !== 'user' ||
-      typeof userMessage.content !== 'string' ||
-      assistantResponse === undefined
-    ) {
-      throw new Error('会话没有可重试的完整普通任务');
-    }
-    const toolResults = turnMessages
-      .filter((message) => message.role === 'tool' && typeof message.content === 'string')
-      .map((message) => message.content as string);
+    if (sourceTurn === undefined) throw new Error('会话普通任务与显示历史不一致');
+
     return this.trackExtraction(this.memories.extractTurn({
       workspace: session.workspace,
       sessionId: id,
-      sourceTurn: session.turns,
-      userPrompt: userMessage.content,
-      assistantResponse,
-      toolResults,
+      sourceTurn,
+      userPrompt: selectedTurn.userPrompt,
+      assistantResponse: selectedTurn.assistantResponse,
+      toolResults: selectedTurn.toolResults,
       signal,
     }));
   }
