@@ -123,6 +123,16 @@ export class SessionService {
     };
   }
 
+  /** 首轮使用已脱敏显示文本生成持久标题，后续轮次不修改标题。 */
+  private createFirstTurnPatch(
+    session: Pick<SessionDetail, 'turns'>,
+    message: NewDisplayMessage,
+  ): SessionPatch {
+    return session.turns === 0
+      ? { title: message.content.slice(0, 36), updatedAt: message.createdAt }
+      : {};
+  }
+
   /** 返回刚写入的显示消息，供调用方在持久化后更新界面。 */
   private loadLatestDisplayMessage(id: string): StoredDisplayMessage {
     const message = this.persistence.loadDisplayMessages(id).at(-1);
@@ -218,7 +228,11 @@ export class SessionService {
   ): Promise<SessionRunResult> {
     const session = this.persistence.getSession(sessionId);
     const displayUserMessage = this.createDisplayMessage('user', prompt);
-    this.persistence.beginDisplayOnlyTurn(sessionId, displayUserMessage);
+    this.persistence.beginDisplayOnlyTurn(
+      sessionId,
+      displayUserMessage,
+      this.createFirstTurnPatch(session, displayUserMessage),
+    );
     notifyObserver(hooks.onDisplayMessage, this.loadLatestDisplayMessage(sessionId));
     notifyObserver(hooks.onStatus, 'running');
 
@@ -279,7 +293,12 @@ export class SessionService {
             throw new Error('首批模型消息必须是一条用户文本');
           }
           const userMessage = sanitizeAgentMessage(messages[0], this.sanitize);
-          this.persistence.beginTurn(sessionId, displayUserMessage, userMessage);
+          this.persistence.beginTurn(
+            sessionId,
+            displayUserMessage,
+            userMessage,
+            this.createFirstTurnPatch(session, displayUserMessage),
+          );
           waitingForUserMessage = false;
           currentTurnMessages.push(userMessage);
           notifyObserver(hooks.onDisplayMessage, this.loadLatestDisplayMessage(sessionId));

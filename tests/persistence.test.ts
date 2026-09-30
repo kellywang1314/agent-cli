@@ -695,6 +695,32 @@ describe('PersistenceStore session CRUD', () => {
     store.close();
   });
 
+  it('开始首轮事务时原子写入用户消息和会话标题', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    const session = buildSession();
+    store.createSession(session);
+
+    store.beginTurn(
+      session.id,
+      buildDisplayMessage(),
+      { role: 'user', content: '用户输入' },
+      { title: '用户输入', updatedAt: 2 },
+    );
+
+    expect(store.getSession(session.id)).toMatchObject({
+      title: '用户输入',
+      status: 'running',
+      turns: 1,
+      updatedAt: 2,
+    });
+    expect(store.loadDisplayMessages(session.id)).toHaveLength(1);
+    expect(store.loadAgentMessages(session.id)).toEqual([
+      { role: 'user', content: '用户输入' },
+    ]);
+    store.close();
+  });
+
   it('agent payload 写入和读取都执行严格 schema 校验', async () => {
     const databasePath = await createDatabasePath();
     const store = new PersistenceStore(databasePath);

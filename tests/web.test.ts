@@ -5,6 +5,10 @@ import { request as httpRequest } from 'node:http';
 import { afterEach, expect, it } from 'vitest';
 import { loadConfig } from '../src/config/loadConfig.js';
 import type { ModelProvider } from '../src/providers/types.js';
+import {
+  activateSession,
+  setActiveIfCurrent,
+} from '../src/web/activeSession.js';
 import { startWebServer } from '../src/web/server.js';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -111,6 +115,45 @@ const textProvider: ModelProvider = {
   /** 测试不请求计费图片。 */
   async generateImage() { throw new Error('unused'); },
 };
+
+it('切换会话后丢弃旧请求和响应 ID 不匹配的详情', async () => {
+  const activeIdRef = { current: '' };
+  const activeIds: string[] = [];
+  const activeSessions: Array<{ id: string }> = [];
+  let resolveOld!: (session: { id: string }) => void;
+  const oldResponse = new Promise<{ id: string }>((resolve) => {
+    resolveOld = resolve;
+  });
+
+  activateSession('old', activeIdRef, (id) => activeIds.push(id));
+  const oldUpdate = oldResponse.then((session) => {
+    setActiveIfCurrent(
+      'old',
+      activeIdRef,
+      session,
+      (current) => activeSessions.push(current),
+    );
+  });
+  activateSession('new', activeIdRef, (id) => activeIds.push(id));
+  setActiveIfCurrent(
+    'new',
+    activeIdRef,
+    { id: 'new' },
+    (current) => activeSessions.push(current),
+  );
+  setActiveIfCurrent(
+    'new',
+    activeIdRef,
+    { id: 'other' },
+    (current) => activeSessions.push(current),
+  );
+  resolveOld({ id: 'old' });
+  await oldUpdate;
+
+  expect(activeIdRef.current).toBe('new');
+  expect(activeIds).toEqual(['old', 'new']);
+  expect(activeSessions).toEqual([{ id: 'new' }]);
+});
 
 it('拒绝未鉴权、跨域和错误 Host 请求，不泄漏配置密钥', async () => {
   const { server, request } = await setup(textProvider);
@@ -259,7 +302,7 @@ it('流式失败只记录未完成提示，不伪造模型历史', async () => {
   expect(JSON.stringify(observedMessages[1])).not.toContain('partial');
 });
 
-it('服务重启后只在摘要列表返回元数据并按需恢复会话详情', async () => {
+it('服务重启后保留首轮 prompt 标题并按需恢复会话详情', async () => {
   const databasePath = await createDatabasePath();
   const first = await setup(textProvider, databasePath);
   const { id } = await (await first.request('/api/sessions', {})).json();
@@ -270,8 +313,12 @@ it('服务重启后只在摘要列表返回元数据并按需恢复会话详情'
 
   const second = await setup(textProvider, databasePath, first.workspace);
   const state = await (await second.request('/api/state')).json();
+  expect(state.sessions.find((item: any) => item.id === id)).toMatchObject({
+    title: 'persist me',
+  });
   expect(state.sessions.find((item: any) => item.id === id)).not.toHaveProperty('messages');
   const detail = await (await second.request(`/api/sessions/${id}`)).json();
+  expect(detail.title).toBe('persist me');
   expect(detail.messages.map((message: any) => message.role)).toEqual(['user', 'assistant']);
 });
 

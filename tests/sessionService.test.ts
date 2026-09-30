@@ -87,6 +87,54 @@ it('先持久化用户消息再调用模型，并在完成后启动记忆提取'
   await expect(result.memoryExtraction).resolves.toEqual([]);
 });
 
+it('CLI 首轮任务将脱敏并截断后的 prompt 持久化为会话标题', async () => {
+  const provider = createSessionProvider(async () => ({ content: '完成', toolCalls: [] }));
+  const tools: ToolExecutor = { getDefinitions: () => [], execute: async () => 'ok' };
+  const secret = 'private-secret';
+  const sanitize = (value: string): string => value.replaceAll(secret, '[REDACTED]');
+  const { store, service, hooks, directory } = await setupSessionTest(
+    provider,
+    tools,
+    sanitize,
+  );
+  const sessionId = await service.create('cli', directory);
+  const prompt = `请处理 ${secret} 并保留这个超过三十六字符的任务标题用于持久化验证`;
+
+  const result = await service.run(sessionId, prompt, hooks, new AbortController().signal);
+  await result.memoryExtraction;
+
+  expect(store.getSession(sessionId).title).toBe(sanitize(prompt).slice(0, 36));
+  expect(JSON.stringify({
+    session: store.getSession(sessionId),
+    displayMessages: store.loadDisplayMessages(sessionId),
+    agentMessages: store.loadAgentMessages(sessionId),
+  })).not.toContain(secret);
+});
+
+it('首轮用户消息写入失败时不单独持久化会话标题', async () => {
+  const provider = createSessionProvider(async () => ({ content: '不应调用', toolCalls: [] }));
+  const tools: ToolExecutor = { getDefinitions: () => [], execute: async () => 'ok' };
+  const { store, service, sessionId, hooks } = await setupSessionTest(provider, tools);
+  getTestDatabase(store).exec(`
+    CREATE TRIGGER failFirstUserDisplayInsert
+    BEFORE INSERT ON displayMessages
+    WHEN NEW.role = 'user'
+    BEGIN
+      SELECT RAISE(ABORT, 'forced first display failure');
+    END;
+  `);
+
+  await expect(service.run(
+    sessionId,
+    '不得单独保存为标题',
+    hooks,
+    new AbortController().signal,
+  )).rejects.toThrow('forced first display failure');
+
+  expect(store.getSession(sessionId).title).toBe('新任务');
+  expect(store.loadDisplayMessages(sessionId).map(({ role }) => role)).toEqual(['notice']);
+});
+
 it('最终 display 写入失败时不保留隐藏的成功 assistant 或 idle 状态', async () => {
   const provider = createSessionProvider(async () => ({ content: '不应残留', toolCalls: [] }));
   const tools: ToolExecutor = { getDefinitions: () => [], execute: async () => 'ok' };

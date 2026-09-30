@@ -462,6 +462,7 @@ export class PersistenceStore {
     sessionId: string,
     display: NewDisplayMessage,
     agent: ChatCompletionMessageParam,
+    patch: SessionPatch = {},
   ): void {
     const parsedAgent = persistedAgentMessageSchema.parse(agent);
     this.transaction(() => {
@@ -471,11 +472,16 @@ export class PersistenceStore {
       this.database.prepare(`
         UPDATE sessions SET turns = turns + 1, status = ? WHERE id = ?
       `).run('running', sessionId);
+      this.applySessionPatch(sessionId, patch);
     });
   }
 
   /** 原子写入仅展示给用户的消息，并将会话推进一轮。 */
-  beginDisplayOnlyTurn(sessionId: string, display: NewDisplayMessage): void {
+  beginDisplayOnlyTurn(
+    sessionId: string,
+    display: NewDisplayMessage,
+    patch: SessionPatch = {},
+  ): void {
     this.transaction(() => {
       this.assertSessionExists(sessionId);
       const sequence = this.nextSequence('displayMessages', sessionId);
@@ -493,6 +499,7 @@ export class PersistenceStore {
       this.database.prepare(`
         UPDATE sessions SET turns = turns + 1, status = ? WHERE id = ?
       `).run('running', sessionId);
+      this.applySessionPatch(sessionId, patch);
     });
   }
 

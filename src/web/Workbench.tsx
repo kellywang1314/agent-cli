@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type SyntheticEvent } from 'react';
+import { activateSession, setActiveIfCurrent } from './activeSession.js';
 import { api, subscribe } from './api.js';
 import { AgentMark, CopyButton, Icon, Markdown, PermissionCard } from './components.js';
 import { Inspector } from './Inspector.js';
@@ -35,13 +36,12 @@ export function Workbench() {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const pendingRef = useRef(false);
   const activeIdRef = useRef(activeId);
-  activeIdRef.current = activeId;
   const workspace = active?.workspace ?? state?.workspace ?? '';
 
   useEffect(() => subscribe(
     setState,
     (session) => {
-      if (session.id === activeIdRef.current) setActive(session);
+      setActiveIfCurrent(session.id, activeIdRef, session, setActive);
     },
     (ready, error) => {
       setConnected(ready);
@@ -56,22 +56,23 @@ export function Workbench() {
   }, [activeId]);
   useEffect(() => {
     let stale = false;
+    const targetId = activeId;
     if (!activeId) {
       setActive(undefined);
       return () => { stale = true; };
     }
     setActive(undefined);
-    void api<WebSession>(`/api/sessions/${activeId}`).then((session) => {
-      if (!stale) setActive(session);
+    void api<WebSession>(`/api/sessions/${targetId}`).then((session) => {
+      if (!stale) setActiveIfCurrent(targetId, activeIdRef, session, setActive);
     }).catch(() => {
-      if (!stale) setActionError('加载会话失败');
+      if (!stale && activeIdRef.current === targetId) setActionError('加载会话失败');
     });
     return () => { stale = true; };
   }, [activeId]);
   useEffect(() => {
     if (state && activeId && !state.sessions.some((session) => session.id === activeId)) {
       setActive(undefined);
-      setActiveId('');
+      activateSession('', activeIdRef, setActiveId);
     }
   }, [state, activeId]);
   useEffect(() => {
@@ -102,8 +103,9 @@ export function Workbench() {
   async function createSession(targetWorkspace?: string): Promise<string> {
     setInput('');
     const { id } = await api<{ id: string }>('/api/sessions', { workspace: (targetWorkspace ?? workspace) || undefined });
-    setActiveId(id);
-    setActive(await api<WebSession>(`/api/sessions/${id}`));
+    activateSession(id, activeIdRef, setActiveId);
+    const session = await api<WebSession>(`/api/sessions/${id}`);
+    setActiveIfCurrent(id, activeIdRef, session, setActive);
     return id;
   }
 
@@ -118,7 +120,7 @@ export function Workbench() {
       setInput('');
       followRef.current = true;
       const session = await api<WebSession>(`/api/sessions/${id}`);
-      if (activeIdRef.current === id) setActive(session);
+      setActiveIfCurrent(id, activeIdRef, session, setActive);
     });
   }
 
@@ -139,7 +141,7 @@ export function Workbench() {
   /** 显式切换会话时清理当前草稿，避免把任务发到错误上下文。 */
   function selectSession(id: string): void {
     setInput('');
-    setActiveId(id);
+    activateSession(id, activeIdRef, setActiveId);
   }
 
   /** 用户确认后仅删除空闲会话。 */
@@ -153,7 +155,7 @@ export function Workbench() {
       } : current);
       if (activeId === id) {
         setActive(undefined);
-        setActiveId('');
+        activateSession('', activeIdRef, setActiveId);
       }
     });
   }
@@ -238,8 +240,10 @@ export function Workbench() {
             </div></article>}
           {active?.permission && <PermissionCard permission={active.permission} disabled={pending || !connected}
             onRespond={(approved) => void perform(async () => {
-              await api(`/api/sessions/${active.id}/permission`, { id: active.permission!.id, approved });
-              setActive(await api<WebSession>(`/api/sessions/${active.id}`));
+              const targetId = active.id;
+              await api(`/api/sessions/${targetId}/permission`, { id: active.permission!.id, approved });
+              const session = await api<WebSession>(`/api/sessions/${targetId}`);
+              setActiveIfCurrent(targetId, activeIdRef, session, setActive);
             })} />}
         </section>}
       </div>
