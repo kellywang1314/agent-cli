@@ -724,6 +724,8 @@ describe('候选确认与正式记忆', () => {
     'github_pat_11AA22BB33_ccccdddd1111222233334444',
     ['xox', 'b-test-token-1234567890'].join(''),
     ['xox', 'p-test-token-1234567890'].join(''),
+    'xapp-123456789012-abcdefghijklmnopqrstuvwx',
+    'xwfp-123456789012-abcdefghijklmnopqrstuvwx',
     'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature_123',
   ])('拒绝候选接受和正式编辑中的潜在凭据：%s', async (secret) => {
     const store = await createStore();
@@ -740,6 +742,12 @@ describe('候选确认与正式记忆', () => {
       action: 'accept',
       content: secret,
     })).rejects.toThrow('记忆内容包含潜在敏感信息');
+    expect(store.listMemoryCandidates('session-1')).toMatchObject([{
+      id: 'candidate-1',
+      status: 'pending',
+      acceptedMemoryId: null,
+    }]);
+    expect(store.listMemories('/workspace/one')).toEqual([]);
 
     const memory = await service.resolveCandidate(
       'session-1',
@@ -748,6 +756,11 @@ describe('候选确认与正式记忆', () => {
     );
     expect(() => service.updateMemory('session-1', memory!.id, { content: secret }))
       .toThrow('记忆内容包含潜在敏感信息');
+    expect(store.listMemories('/workspace/one')).toMatchObject([{
+      id: memory!.id,
+      content: '使用 React 19',
+      normalizedContent: '使用 react 19',
+    }]);
   });
 
   it.each([

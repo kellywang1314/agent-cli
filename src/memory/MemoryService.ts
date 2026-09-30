@@ -59,7 +59,7 @@ export function normalizeMemoryContent(content: string): string {
 
 /** 拒绝不应进入长期存储的常见凭据。 */
 export function containsPotentialSecret(content: string): boolean {
-  return /-----BEGIN [A-Z ]*PRIVATE KEY-----|Bearer\s+\S{16,}|(?:sk|ak)-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[a-z]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/i
+  return /-----BEGIN [A-Z ]*PRIVATE KEY-----|Bearer\s+\S{16,}|(?:sk|ak)-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|(?:xox[a-z]|xapp|xwfp)-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/i
     .test(content);
 }
 
