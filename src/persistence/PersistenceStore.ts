@@ -297,6 +297,33 @@ export class PersistenceStore {
     return String(row.workspace);
   }
 
+  /** 在当前事务内校验并批量写入记忆候选。 */
+  private insertMemoryCandidateRows(candidates: StoredMemoryCandidate[]): void {
+    const insert = this.database.prepare(`
+      INSERT INTO memoryCandidates (
+        id, workspace, sourceSessionId, sourceTurn, category, content,
+        normalizedContent, status, acceptedMemoryId, createdAt, resolvedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const candidate of candidates) {
+      const workspace = this.getSessionWorkspace(candidate.sourceSessionId);
+      if (workspace !== candidate.workspace) throw new Error('会话工作区不匹配');
+      insert.run(
+        candidate.id,
+        candidate.workspace,
+        candidate.sourceSessionId,
+        candidate.sourceTurn,
+        candidate.category,
+        candidate.content,
+        candidate.normalizedContent,
+        candidate.status,
+        candidate.acceptedMemoryId,
+        candidate.createdAt,
+        candidate.resolvedAt,
+      );
+    }
+  }
+
   /** 在指定消息表中计算会话的下一个严格递增序号。 */
   private nextSequence(
     table: 'displayMessages' | 'agentMessages',
@@ -522,29 +549,25 @@ export class PersistenceStore {
   /** 在单个事务中批量写入记忆候选，任一失败时全部回滚。 */
   insertMemoryCandidates(candidates: StoredMemoryCandidate[]): void {
     this.transaction(() => {
-      const insert = this.database.prepare(`
-        INSERT INTO memoryCandidates (
-          id, workspace, sourceSessionId, sourceTurn, category, content,
-          normalizedContent, status, acceptedMemoryId, createdAt, resolvedAt
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      for (const candidate of candidates) {
-        const workspace = this.getSessionWorkspace(candidate.sourceSessionId);
-        if (workspace !== candidate.workspace) throw new Error('会话工作区不匹配');
-        insert.run(
-          candidate.id,
-          candidate.workspace,
-          candidate.sourceSessionId,
-          candidate.sourceTurn,
-          candidate.category,
-          candidate.content,
-          candidate.normalizedContent,
-          candidate.status,
-          candidate.acceptedMemoryId,
-          candidate.createdAt,
-          candidate.resolvedAt,
-        );
+      this.insertMemoryCandidateRows(candidates);
+    });
+  }
+
+  /** 原子写入本次候选并将对应会话的提取状态标记为完成。 */
+  completeMemoryExtraction(
+    sessionId: string,
+    candidates: StoredMemoryCandidate[],
+  ): void {
+    this.transaction(() => {
+      this.assertSessionExists(sessionId);
+      if (candidates.some(({ sourceSessionId }) => sourceSessionId !== sessionId)) {
+        throw new Error('记忆候选源会话不匹配');
       }
+      this.insertMemoryCandidateRows(candidates);
+      this.applySessionPatch(sessionId, {
+        memoryExtractionStatus: 'complete',
+        memoryExtractionError: null,
+      });
     });
   }
 

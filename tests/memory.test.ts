@@ -267,6 +267,30 @@ describe('记忆提取与提示词', () => {
       .toContain('existing-candidate');
   });
 
+  it('忽略候选后再次提取相同内容会重新产生待处理候选', async () => {
+    const store = await createStore();
+    store.createSession(buildSession());
+    store.insertMemoryCandidates([buildCandidate()]);
+    store.resolveMemoryCandidate('session-1', 'candidate-1', { action: 'ignore' }, 11);
+    const service = new MemoryService(
+      store,
+      createProvider(JSON.stringify({
+        candidates: [{ category: 'rule', content: '使用 React 19' }],
+      })),
+      (text) => text,
+    );
+
+    const candidates = await service.extractTurn(buildExtractionInput());
+
+    expect(candidates).toMatchObject([{
+      content: '使用 React 19',
+      normalizedContent: '使用 react 19',
+      status: 'pending',
+    }]);
+    expect(store.listMemoryCandidates('session-1').map(({ status }) => status))
+      .toEqual(['ignored', 'pending']);
+  });
+
   it('停用的正式记忆不注入提示，但仍参与同工作区去重', async () => {
     const store = await createStore();
     store.createSession(buildSession());
@@ -397,6 +421,37 @@ describe('候选确认与正式记忆', () => {
     )).rejects.toThrow('记忆候选已处理');
   });
 
+  it('已处理候选优先报告状态错误而非编辑内容中的敏感信息', async () => {
+    const store = await createStore();
+    store.createSession(buildSession());
+    store.insertMemoryCandidates([
+      buildCandidate({ id: 'accepted-candidate' }),
+      buildCandidate({ id: 'ignored-candidate', createdAt: 11 }),
+    ]);
+    const service = new MemoryService(
+      store,
+      createProvider('{"candidates":[]}'),
+      (text) => text,
+    );
+    await service.resolveCandidate(
+      'session-1',
+      'accepted-candidate',
+      { action: 'accept' },
+    );
+    await service.resolveCandidate(
+      'session-1',
+      'ignored-candidate',
+      { action: 'ignore' },
+    );
+
+    for (const candidateId of ['accepted-candidate', 'ignored-candidate']) {
+      await expect(service.resolveCandidate('session-1', candidateId, {
+        action: 'accept',
+        content: 'Bearer abcdefghijklmnop',
+      })).rejects.toThrow('记忆候选已处理');
+    }
+  });
+
   it('同工作区重复接受复用正式记忆，不跨工作区复用', async () => {
     const store = await createStore();
     store.createSession(buildSession());
@@ -451,7 +506,7 @@ describe('候选确认与正式记忆', () => {
     await expect(service.resolveCandidate('session-1', 'candidate-1', {
       action: 'accept',
       content: secret,
-    })).rejects.toThrow('记忆内容包含潜在凭据');
+    })).rejects.toThrow('记忆内容包含潜在敏感信息');
 
     const memory = await service.resolveCandidate(
       'session-1',
@@ -459,7 +514,7 @@ describe('候选确认与正式记忆', () => {
       { action: 'accept' },
     );
     expect(() => service.updateMemory('session-1', memory!.id, { content: secret }))
-      .toThrow('记忆内容包含潜在凭据');
+      .toThrow('记忆内容包含潜在敏感信息');
   });
 
   it('编辑、停用、恢复和删除正式记忆，并锁定空 patch 为拒绝', async () => {

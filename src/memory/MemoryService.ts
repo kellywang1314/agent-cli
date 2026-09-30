@@ -81,7 +81,7 @@ export class MemoryService {
   private validateMemoryContent(content: string): string {
     const parsed = memoryContentSchema.safeParse(this.sanitize(content));
     if (!parsed.success) throw new Error('记忆内容无效');
-    if (containsPotentialSecret(parsed.data)) throw new Error('记忆内容包含潜在凭据');
+    if (containsPotentialSecret(parsed.data)) throw new Error('记忆内容包含潜在敏感信息');
     return parsed.data;
   }
 
@@ -94,7 +94,10 @@ export class MemoryService {
     for (const session of this.store.listSessions({ workspace })) {
       const candidate = this.store.listMemoryCandidates(session.id)
         .find(({ id }) => id === candidateId);
-      if (candidate) return candidate;
+      if (candidate) {
+        if (candidate.status !== 'pending') throw new Error('记忆候选已处理');
+        return candidate;
+      }
     }
     throw new Error(`记忆候选不存在：${candidateId}`);
   }
@@ -142,7 +145,7 @@ export class MemoryService {
       )));
       for (const workspaceSession of this.store.listSessions({ workspace: input.workspace })) {
         for (const candidate of this.store.listMemoryCandidates(workspaceSession.id)) {
-          knownContent.add(candidate.normalizedContent);
+          if (candidate.status !== 'ignored') knownContent.add(candidate.normalizedContent);
         }
       }
 
@@ -169,11 +172,7 @@ export class MemoryService {
         });
       }
 
-      this.store.updateSession(input.sessionId, {
-        memoryExtractionStatus: 'complete',
-        memoryExtractionError: null,
-      });
-      this.store.insertMemoryCandidates(candidates);
+      this.store.completeMemoryExtraction(input.sessionId, candidates);
       return candidates;
     } catch (error) {
       this.store.updateSession(input.sessionId, {

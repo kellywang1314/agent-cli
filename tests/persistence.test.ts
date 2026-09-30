@@ -928,6 +928,75 @@ describe('PersistenceStore memory transactions', () => {
     store.close();
   });
 
+  it('空候选批次也会原子完成提取并清空旧错误', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    store.createSession(buildSession({
+      memoryExtractionStatus: 'running',
+      memoryExtractionError: '旧错误',
+    }));
+
+    store.completeMemoryExtraction('session-1', []);
+
+    expect(store.getSession('session-1')).toMatchObject({
+      memoryExtractionStatus: 'complete',
+      memoryExtractionError: null,
+    });
+    expect(store.listMemoryCandidates('session-1')).toEqual([]);
+    store.close();
+  });
+
+  it('候选插入失败时不留下候选或完成状态', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    store.createSession(buildSession({ memoryExtractionStatus: 'running' }));
+    getTestDatabase(store).exec(`
+      CREATE TRIGGER failExtractionCandidateInsert
+      BEFORE INSERT ON memoryCandidates
+      BEGIN
+        SELECT RAISE(ABORT, 'forced extraction candidate failure');
+      END;
+    `);
+
+    expect(() => store.completeMemoryExtraction(
+      'session-1',
+      [buildMemoryCandidate()],
+    )).toThrow('forced extraction candidate failure');
+
+    expect(store.listMemoryCandidates('session-1')).toEqual([]);
+    expect(store.getSession('session-1')).toMatchObject({
+      memoryExtractionStatus: 'running',
+      memoryExtractionError: null,
+    });
+    store.close();
+  });
+
+  it('完成状态更新失败时回滚已插入候选', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    store.createSession(buildSession({ memoryExtractionStatus: 'running' }));
+    getTestDatabase(store).exec(`
+      CREATE TRIGGER failExtractionCompletion
+      BEFORE UPDATE ON sessions
+      WHEN NEW.memoryExtractionStatus = 'complete'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced extraction completion failure');
+      END;
+    `);
+
+    expect(() => store.completeMemoryExtraction(
+      'session-1',
+      [buildMemoryCandidate()],
+    )).toThrow('forced extraction completion failure');
+
+    expect(store.listMemoryCandidates('session-1')).toEqual([]);
+    expect(store.getSession('session-1')).toMatchObject({
+      memoryExtractionStatus: 'running',
+      memoryExtractionError: null,
+    });
+    store.close();
+  });
+
   it('接受候选的后半段失败时回滚新建的正式记忆', async () => {
     const databasePath = await createDatabasePath();
     const store = new PersistenceStore(databasePath);
