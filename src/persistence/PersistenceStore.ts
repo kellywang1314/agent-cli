@@ -6,10 +6,14 @@ import { DatabaseSync } from 'node:sqlite';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 import { persistedAgentMessageSchema } from './messageSchema.js';
 import type {
+  MemoryCandidateStatus,
   NewDisplayMessage,
   SessionPatch,
   SessionQuery,
+  StoredCandidateResolution,
   StoredDisplayMessage,
+  StoredMemory,
+  StoredMemoryCandidate,
   StoredSession,
 } from './types.js';
 
@@ -178,6 +182,46 @@ function mapDisplayMessage(row: Record<string, unknown>): StoredDisplayMessage {
   };
 }
 
+/** 将 SQLite 查询结果转换为强类型记忆候选。 */
+function mapMemoryCandidate(row: Record<string, unknown>): StoredMemoryCandidate {
+  return {
+    id: String(row.id),
+    workspace: String(row.workspace),
+    sourceSessionId: String(row.sourceSessionId),
+    sourceTurn: Number(row.sourceTurn),
+    category: row.category as StoredMemoryCandidate['category'],
+    content: String(row.content),
+    normalizedContent: String(row.normalizedContent),
+    status: row.status as StoredMemoryCandidate['status'],
+    acceptedMemoryId: row.acceptedMemoryId === null ? null : String(row.acceptedMemoryId),
+    createdAt: Number(row.createdAt),
+    resolvedAt: row.resolvedAt === null ? null : Number(row.resolvedAt),
+  };
+}
+
+/** 将 SQLite 查询结果转换为强类型正式记忆。 */
+function mapMemory(row: Record<string, unknown>): StoredMemory {
+  return {
+    id: String(row.id),
+    workspace: String(row.workspace),
+    category: row.category as StoredMemory['category'],
+    content: String(row.content),
+    normalizedContent: String(row.normalizedContent),
+    active: Number(row.active) === 1,
+    sourceSessionId: row.sourceSessionId === null ? null : String(row.sourceSessionId),
+    createdAt: Number(row.createdAt),
+    updatedAt: Number(row.updatedAt),
+  };
+}
+
+/** 使用与服务层一致的稳定规则计算正式记忆去重键。 */
+function normalizeStoredMemoryContent(content: string): string {
+  return content.normalize('NFKC').trim().replace(/\s+/gu, ' ').replace(
+    /[A-Z]/g,
+    (character) => character.toLowerCase(),
+  );
+}
+
 export class PersistenceStore {
   private readonly database: DatabaseSync;
 
@@ -244,6 +288,13 @@ export class PersistenceStore {
   private assertSessionExists(id: string): void {
     const row = this.database.prepare('SELECT id FROM sessions WHERE id = ?').get(id);
     if (!row) throw new Error(`会话不存在：${id}`);
+  }
+
+  /** 返回调用会话的工作区，不存在时拒绝后续资源访问。 */
+  private getSessionWorkspace(id: string): string {
+    const row = this.database.prepare('SELECT workspace FROM sessions WHERE id = ?').get(id);
+    if (!row) throw new Error(`会话不存在：${id}`);
+    return String(row.workspace);
   }
 
   /** 在指定消息表中计算会话的下一个严格递增序号。 */
@@ -465,6 +516,189 @@ export class PersistenceStore {
     this.transaction(() => {
       this.assertSessionExists(id);
       this.applySessionPatch(id, patch);
+    });
+  }
+
+  /** 在单个事务中批量写入记忆候选，任一失败时全部回滚。 */
+  insertMemoryCandidates(candidates: StoredMemoryCandidate[]): void {
+    this.transaction(() => {
+      const insert = this.database.prepare(`
+        INSERT INTO memoryCandidates (
+          id, workspace, sourceSessionId, sourceTurn, category, content,
+          normalizedContent, status, acceptedMemoryId, createdAt, resolvedAt
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const candidate of candidates) {
+        const workspace = this.getSessionWorkspace(candidate.sourceSessionId);
+        if (workspace !== candidate.workspace) throw new Error('会话工作区不匹配');
+        insert.run(
+          candidate.id,
+          candidate.workspace,
+          candidate.sourceSessionId,
+          candidate.sourceTurn,
+          candidate.category,
+          candidate.content,
+          candidate.normalizedContent,
+          candidate.status,
+          candidate.acceptedMemoryId,
+          candidate.createdAt,
+          candidate.resolvedAt,
+        );
+      }
+    });
+  }
+
+  /** 按创建顺序列出会话候选，并可限制候选状态。 */
+  listMemoryCandidates(
+    sessionId: string,
+    status?: MemoryCandidateStatus,
+  ): StoredMemoryCandidate[] {
+    const workspace = this.getSessionWorkspace(sessionId);
+    const statusCondition = status === undefined ? '' : ' AND status = ?';
+    const values = status === undefined
+      ? [sessionId, workspace]
+      : [sessionId, workspace, status];
+    return this.database.prepare(`
+      SELECT *
+      FROM memoryCandidates
+      WHERE sourceSessionId = ? AND workspace = ?${statusCondition}
+      ORDER BY createdAt ASC, id ASC
+    `).all(...values).map(mapMemoryCandidate);
+  }
+
+  /** 列出工作区正式记忆，默认包含停用项并保持稳定更新时间排序。 */
+  listMemories(workspace: string, activeOnly = false): StoredMemory[] {
+    const activeCondition = activeOnly ? ' AND active = ?' : '';
+    const values: Array<string | number> = activeOnly ? [workspace, 1] : [workspace];
+    return this.database.prepare(`
+      SELECT *
+      FROM memories
+      WHERE workspace = ?${activeCondition}
+      ORDER BY updatedAt DESC, id ASC
+    `).all(...values).map(mapMemory);
+  }
+
+  /** 原子忽略候选，或复用/创建正式记忆并标记候选已接受。 */
+  resolveMemoryCandidate(
+    sessionId: string,
+    candidateId: string,
+    decision: StoredCandidateResolution,
+    resolvedAt: number,
+  ): StoredMemory | null {
+    return this.transaction(() => {
+      const workspace = this.getSessionWorkspace(sessionId);
+      const candidateRow = this.database.prepare(`
+        SELECT *
+        FROM memoryCandidates
+        WHERE id = ? AND workspace = ?
+      `).get(candidateId, workspace);
+      if (!candidateRow) throw new Error(`记忆候选不存在：${candidateId}`);
+      const candidate = mapMemoryCandidate(candidateRow);
+      if (candidate.status !== 'pending') throw new Error('记忆候选已处理');
+
+      if (decision.action === 'ignore') {
+        this.database.prepare(`
+          UPDATE memoryCandidates
+          SET status = ?, resolvedAt = ?
+          WHERE id = ? AND status = ?
+        `).run('ignored', resolvedAt, candidateId, 'pending');
+        return null;
+      }
+
+      let memoryRow = this.database.prepare(`
+        SELECT *
+        FROM memories
+        WHERE workspace = ? AND normalizedContent = ?
+      `).get(workspace, decision.normalizedContent);
+      if (!memoryRow) {
+        const memoryId = randomUUID();
+        this.database.prepare(`
+          INSERT INTO memories (
+            id, workspace, category, content, normalizedContent, active,
+            sourceSessionId, createdAt, updatedAt
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          memoryId,
+          workspace,
+          candidate.category,
+          decision.content,
+          decision.normalizedContent,
+          1,
+          candidate.sourceSessionId,
+          resolvedAt,
+          resolvedAt,
+        );
+        memoryRow = this.database.prepare('SELECT * FROM memories WHERE id = ?').get(memoryId);
+      }
+      if (!memoryRow) throw new Error('正式记忆创建失败');
+      const memory = mapMemory(memoryRow);
+      this.database.prepare(`
+        UPDATE memoryCandidates
+        SET status = ?, acceptedMemoryId = ?, resolvedAt = ?
+        WHERE id = ? AND status = ?
+      `).run('accepted', memory.id, resolvedAt, candidateId, 'pending');
+      return memory;
+    });
+  }
+
+  /** 编辑、停用或恢复调用会话工作区内的正式记忆。 */
+  updateMemory(
+    sessionId: string,
+    memoryId: string,
+    patch: { content?: string; active?: boolean },
+  ): StoredMemory {
+    return this.transaction(() => {
+      const workspace = this.getSessionWorkspace(sessionId);
+      const memoryRow = this.database.prepare(`
+        SELECT *
+        FROM memories
+        WHERE id = ? AND workspace = ?
+      `).get(memoryId, workspace);
+      if (!memoryRow) throw new Error(`记忆不存在：${memoryId}`);
+      if (patch.content === undefined && patch.active === undefined) {
+        throw new Error('记忆更新不能为空');
+      }
+      const currentMemory = mapMemory(memoryRow);
+
+      const assignments: string[] = [];
+      const values: Array<string | number> = [];
+      if (patch.content !== undefined) {
+        const normalizedContent = normalizeStoredMemoryContent(patch.content);
+        const duplicate = this.database.prepare(`
+          SELECT id
+          FROM memories
+          WHERE workspace = ? AND normalizedContent = ? AND id <> ?
+        `).get(workspace, normalizedContent, memoryId);
+        if (duplicate) throw new Error('同工作区已存在相同记忆');
+        assignments.push('content = ?', 'normalizedContent = ?');
+        values.push(patch.content, normalizedContent);
+      }
+      if (patch.active !== undefined) {
+        assignments.push('active = ?');
+        values.push(patch.active ? 1 : 0);
+      }
+      assignments.push('updatedAt = ?');
+      values.push(Math.max(Date.now(), currentMemory.updatedAt + 1));
+      this.database.prepare(`
+        UPDATE memories
+        SET ${assignments.join(', ')}
+        WHERE id = ? AND workspace = ?
+      `).run(...values, memoryId, workspace);
+      const updatedRow = this.database.prepare('SELECT * FROM memories WHERE id = ?').get(memoryId);
+      if (!updatedRow) throw new Error(`记忆不存在：${memoryId}`);
+      return mapMemory(updatedRow);
+    });
+  }
+
+  /** 删除调用会话工作区内的正式记忆。 */
+  deleteMemory(sessionId: string, memoryId: string): void {
+    this.transaction(() => {
+      const workspace = this.getSessionWorkspace(sessionId);
+      const result = this.database.prepare(`
+        DELETE FROM memories
+        WHERE id = ? AND workspace = ?
+      `).run(memoryId, workspace);
+      if (result.changes === 0) throw new Error(`记忆不存在：${memoryId}`);
     });
   }
 

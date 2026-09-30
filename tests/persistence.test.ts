@@ -11,6 +11,7 @@ import { persistedAgentMessageSchema } from '../src/persistence/messageSchema.js
 import { PersistenceStore } from '../src/persistence/PersistenceStore.js';
 import type {
   NewDisplayMessage,
+  StoredMemoryCandidate,
   StoredSession,
 } from '../src/persistence/types.js';
 
@@ -881,5 +882,78 @@ describe('persistedAgentMessageSchema', () => {
     expect(textMessage).toEqual({ role: 'assistant', content: '已完成' });
     expect(toolMessageWithEmptyContent).toMatchObject({ role: 'assistant', content: '' });
     expect(toolMessageWithNullContent).toMatchObject({ role: 'assistant', content: null });
+  });
+});
+
+describe('PersistenceStore memory transactions', () => {
+  /** 构造用于事务测试的待确认记忆候选。 */
+  function buildMemoryCandidate(
+    overrides: Partial<StoredMemoryCandidate> = {},
+  ): StoredMemoryCandidate {
+    return {
+      id: 'candidate-1',
+      workspace: '/workspace/one',
+      sourceSessionId: 'session-1',
+      sourceTurn: 1,
+      category: 'rule',
+      content: '使用 React 19',
+      normalizedContent: '使用 react 19',
+      status: 'pending',
+      acceptedMemoryId: null,
+      createdAt: 10,
+      resolvedAt: null,
+      ...overrides,
+    };
+  }
+
+  it('批量候选插入失败时不留下部分数据', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    store.createSession(buildSession());
+    getTestDatabase(store).exec(`
+      CREATE TRIGGER failCandidateInsert
+      BEFORE INSERT ON memoryCandidates
+      WHEN NEW.id = 'candidate-fail'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced candidate insert failure');
+      END;
+    `);
+
+    expect(() => store.insertMemoryCandidates([
+      buildMemoryCandidate(),
+      buildMemoryCandidate({ id: 'candidate-fail', createdAt: 11 }),
+    ])).toThrow('forced candidate insert failure');
+
+    expect(store.listMemoryCandidates('session-1')).toEqual([]);
+    store.close();
+  });
+
+  it('接受候选的后半段失败时回滚新建的正式记忆', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    store.createSession(buildSession());
+    store.insertMemoryCandidates([buildMemoryCandidate()]);
+    getTestDatabase(store).exec(`
+      CREATE TRIGGER failCandidateResolve
+      BEFORE UPDATE ON memoryCandidates
+      WHEN NEW.status = 'accepted'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced candidate resolve failure');
+      END;
+    `);
+
+    expect(() => store.resolveMemoryCandidate('session-1', 'candidate-1', {
+      action: 'accept',
+      content: '使用 React 19',
+      normalizedContent: '使用 react 19',
+    }, 20)).toThrow('forced candidate resolve failure');
+
+    expect(store.listMemories('/workspace/one')).toEqual([]);
+    expect(store.listMemoryCandidates('session-1')).toMatchObject([{
+      status: 'pending',
+      acceptedMemoryId: null,
+      resolvedAt: null,
+    }]);
+    store.close();
   });
 });

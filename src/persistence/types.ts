@@ -6,6 +6,9 @@ export type MemoryExtractionStatus = 'idle' | 'running' | 'failed' | 'complete';
 export type DisplayMessageRole = 'user' | 'assistant' | 'notice';
 export type MemoryCategory = 'rule' | 'decision' | 'fact' | 'preference';
 export type MemoryCandidateStatus = 'pending' | 'accepted' | 'ignored';
+export type StoredCandidateResolution =
+  | { action: 'accept'; content: string; normalizedContent: string }
+  | { action: 'ignore' };
 
 export interface StoredSession {
   id: string;
