@@ -15,12 +15,17 @@ export type AgentEvent =
   | { type: 'toolStart'; name: string }
   | { type: 'toolEnd'; name: string; result: string; elapsedMs: number };
 
+export type AgentAppendPhase = 'intermediate' | 'terminal';
+
 interface AgentOptions {
   systemPrompt: string;
   maxRounds: number;
   initialMessages?: ChatCompletionMessageParam[];
   getRuntimeInstructions?: () => Promise<string>;
-  onMessagesAppended?: (messages: ChatCompletionMessageParam[]) => Promise<void>;
+  onMessagesAppended?: (
+    messages: ChatCompletionMessageParam[],
+    phase: AgentAppendPhase,
+  ) => Promise<void>;
   sanitize?: (text: string) => string;
   onEvent?: (event: AgentEvent) => void;
 }
@@ -79,8 +84,11 @@ export class AgentLoop {
   }
 
   /** 先可靠持久化，再更新内存历史，避免模型看到无法恢复的消息。 */
-  private async appendMessages(messages: ChatCompletionMessageParam[]): Promise<void> {
-    await this.options.onMessagesAppended?.(structuredClone(messages));
+  private async appendMessages(
+    messages: ChatCompletionMessageParam[],
+    phase: AgentAppendPhase = 'intermediate',
+  ): Promise<void> {
+    await this.options.onMessagesAppended?.(structuredClone(messages), phase);
     this.messages.push(...messages);
   }
 
@@ -96,7 +104,7 @@ export class AgentLoop {
 
   /** 记录并返回因循环保护而终止的结果。 */
   private async finish(message: string): Promise<string> {
-    await this.appendMessages([{ role: 'assistant', content: message }]);
+    await this.appendMessages([{ role: 'assistant', content: message }], 'terminal');
     this.options.onEvent?.({ type: 'text', text: message });
     return message;
   }
@@ -118,7 +126,10 @@ export class AgentLoop {
           (text) => this.options.onEvent?.({ type: 'text', text }), context.signal);
         context.signal.throwIfAborted();
         if (!reply.toolCalls.length) {
-          await this.appendMessages([{ role: 'assistant', content: reply.content }]);
+          await this.appendMessages(
+            [{ role: 'assistant', content: reply.content }],
+            'terminal',
+          );
           return reply.content;
         }
         if (reply.toolCalls.length > 16) return await this.finish('单轮工具调用超过 16 个，已停止，请拆分任务。');

@@ -48,9 +48,22 @@ function getToolError(value: unknown): string | undefined {
   return typeof value.error === 'string' ? value.error : '工具执行失败';
 }
 
+/** 尽力通知观察方，避免 UI Hook 异常改变任务业务结果。 */
+function notifyObserver<T>(observer: (value: T) => void, value: T): void {
+  try {
+    observer(value);
+  } catch {
+    // 观察方不参与任务事务或业务控制流。
+  }
+}
+
 export class SessionService {
   private readonly running = new Set<string>();
+  private readonly activeRunTasks = new Set<Promise<unknown>>();
   private readonly extractionTasks = new Set<Promise<unknown>>();
+  private readonly sessionExtractionTasks = new Map<string, Set<Promise<unknown>>>();
+  private closing = false;
+  private closePromise: Promise<void> | undefined;
 
   /** 创建共享会话服务，复用调用方持有的模型、工具、数据库和记忆服务。 */
   constructor(
@@ -64,6 +77,7 @@ export class SessionService {
 
   /** 校验真实工作区目录并创建可持久恢复的空会话。 */
   async create(clientType: SessionClientType, workspace: string): Promise<string> {
+    this.assertWritable();
     const root = await realpath(workspace);
     if (!(await stat(root)).isDirectory()) throw new Error('工作区必须是目录');
     const id = randomUUID();
@@ -127,20 +141,31 @@ export class SessionService {
     const message = this.createDisplayMessage(role, content);
     this.persistence.appendDisplayMessage(id, message, patch);
     const stored = this.loadLatestDisplayMessage(id);
-    hooks.onDisplayMessage(stored);
-    if (patch.status !== undefined) hooks.onStatus(patch.status);
+    notifyObserver(hooks.onDisplayMessage, stored);
+    if (patch.status !== undefined) notifyObserver(hooks.onStatus, patch.status);
     return stored;
+  }
+
+  /** 关闭开始后拒绝新的会话写操作。 */
+  private assertWritable(): void {
+    if (this.closing) throw new Error('会话服务正在关闭');
   }
 
   /** 跟踪后台记忆提取，并在成功或失败后释放关闭等待集合。 */
   private trackExtraction(
+    sessionId: string,
     task: Promise<StoredMemoryCandidate[]>,
   ): Promise<StoredMemoryCandidate[]> {
     this.extractionTasks.add(task);
-    void task.then(
-      () => this.extractionTasks.delete(task),
-      () => this.extractionTasks.delete(task),
-    );
+    const sessionTasks = this.sessionExtractionTasks.get(sessionId) ?? new Set();
+    sessionTasks.add(task);
+    this.sessionExtractionTasks.set(sessionId, sessionTasks);
+    const cleanup = (): void => {
+      this.extractionTasks.delete(task);
+      sessionTasks.delete(task);
+      if (sessionTasks.size === 0) this.sessionExtractionTasks.delete(sessionId);
+    };
+    void task.then(cleanup, cleanup);
     return task;
   }
 
@@ -177,7 +202,7 @@ export class SessionService {
     } catch {
       try {
         this.persistence.updateSession(id, { status, updatedAt: Date.now() });
-        hooks.onStatus(status);
+        notifyObserver(hooks.onStatus, status);
       } catch {
         // 失败报告不得覆盖触发任务失败的原始错误。
       }
@@ -194,18 +219,18 @@ export class SessionService {
     const session = this.persistence.getSession(sessionId);
     const displayUserMessage = this.createDisplayMessage('user', prompt);
     this.persistence.beginDisplayOnlyTurn(sessionId, displayUserMessage);
-    hooks.onDisplayMessage(this.loadLatestDisplayMessage(sessionId));
-    hooks.onStatus('running');
+    notifyObserver(hooks.onDisplayMessage, this.loadLatestDisplayMessage(sessionId));
+    notifyObserver(hooks.onStatus, 'running');
 
     const startedAt = Date.now();
-    hooks.onAgentEvent({ type: 'toolStart', name: 'generateImage' });
+    notifyObserver(hooks.onAgentEvent, { type: 'toolStart', name: 'generateImage' });
     const imageResult = await this.tools.execute('generateImage', {
       prompt: prompt.slice(7).trim(),
     }, this.createToolContext(session.workspace, hooks, signal));
     signal.throwIfAborted();
     const content = JSON.stringify(imageResult, null, 2) ?? 'null';
     const eventResult = this.sanitize(JSON.stringify(imageResult) ?? 'null');
-    hooks.onAgentEvent({
+    notifyObserver(hooks.onAgentEvent, {
       type: 'toolEnd',
       name: 'generateImage',
       result: eventResult,
@@ -233,6 +258,7 @@ export class SessionService {
     const displayUserMessage = this.createDisplayMessage('user', prompt);
     const currentTurnMessages: ChatCompletionMessageParam[] = [];
     let waitingForUserMessage = true;
+    let assistantMessage: StoredDisplayMessage | undefined;
     const agent = new AgentLoop(this.provider, this.tools, {
       systemPrompt: redactSecrets(
         createSystemPrompt(session.workspace, projectContext),
@@ -242,8 +268,8 @@ export class SessionService {
       initialMessages,
       sanitize: this.sanitize,
       getRuntimeInstructions: () => this.memories.buildRuntimeInstructions(session.workspace),
-      onEvent: hooks.onAgentEvent,
-      onMessagesAppended: async (messages) => {
+      onEvent: (event) => notifyObserver(hooks.onAgentEvent, event),
+      onMessagesAppended: async (messages, phase) => {
         if (waitingForUserMessage) {
           if (
             messages.length !== 1 ||
@@ -256,32 +282,55 @@ export class SessionService {
           this.persistence.beginTurn(sessionId, displayUserMessage, userMessage);
           waitingForUserMessage = false;
           currentTurnMessages.push(userMessage);
-          hooks.onDisplayMessage(this.loadLatestDisplayMessage(sessionId));
-          hooks.onStatus('running');
+          notifyObserver(hooks.onDisplayMessage, this.loadLatestDisplayMessage(sessionId));
+          notifyObserver(hooks.onStatus, 'running');
           return;
         }
         const sanitized = messages.map((message) => (
           sanitizeAgentMessage(message, this.sanitize)
         ));
+        if (phase === 'terminal') {
+          const originalTerminalMessage = messages[0];
+          const terminalMessage = sanitized[0];
+          if (
+            sanitized.length !== 1
+            || originalTerminalMessage?.role !== 'assistant'
+            || typeof originalTerminalMessage.content !== 'string'
+            || terminalMessage?.role !== 'assistant'
+            || typeof terminalMessage.content !== 'string'
+          ) {
+            throw new Error('最终模型消息必须是一条 assistant 文本');
+          }
+          const displayMessage = this.createDisplayMessage(
+            'assistant',
+            originalTerminalMessage.content,
+          );
+          this.persistence.completeTurn(sessionId, terminalMessage, displayMessage, {
+            status: 'idle',
+            updatedAt: Date.now(),
+          });
+          currentTurnMessages.push(terminalMessage);
+          assistantMessage = this.loadLatestDisplayMessage(sessionId);
+          notifyObserver(hooks.onDisplayMessage, assistantMessage);
+          notifyObserver(hooks.onStatus, 'idle');
+          return;
+        }
         this.persistence.appendAgentMessages(sessionId, sanitized);
         currentTurnMessages.push(...sanitized);
       },
     });
 
-    const content = await agent.run(
+    await agent.run(
       prompt,
       this.createToolContext(session.workspace, hooks, signal),
     );
-    const assistantMessage = this.appendDisplayMessage(sessionId, 'assistant', content, {
-      status: 'idle',
-      updatedAt: Date.now(),
-    }, hooks);
+    if (!assistantMessage) throw new Error('最终模型消息未完成持久化');
     const sourceTurn = this.persistence.getSession(sessionId).turns;
     const toolResults = currentTurnMessages
       .filter((message) => message.role === 'tool' && typeof message.content === 'string')
       .map((message) => message.content as string);
     const extractionController = new AbortController();
-    const memoryExtraction = this.trackExtraction(this.memories.extractTurn({
+    const memoryExtraction = this.trackExtraction(sessionId, this.memories.extractTurn({
       workspace: session.workspace,
       sessionId,
       sourceTurn,
@@ -293,16 +342,13 @@ export class SessionService {
     return { content: assistantMessage.content, memoryExtraction };
   }
 
-  /** 运行一次普通或图片任务，并防止同一会话并发修改历史。 */
-  async run(
+  /** 执行已登记的前台任务，并记录失败状态。 */
+  private async executeRun(
     id: string,
     prompt: string,
     hooks: SessionRunHooks,
     signal: AbortSignal,
   ): Promise<SessionRunResult> {
-    this.persistence.getSession(id);
-    if (this.running.has(id)) throw new Error('已有任务正在执行');
-    this.running.add(id);
     try {
       return prompt.startsWith('/image ')
         ? await this.runImage(id, prompt, hooks, signal)
@@ -310,14 +356,37 @@ export class SessionService {
     } catch (error) {
       this.recordRunFailure(id, error, hooks, signal);
       throw error;
-    } finally {
-      this.running.delete(id);
     }
+  }
+
+  /** 运行一次普通或图片任务，并跟踪其完整前台生命周期。 */
+  async run(
+    id: string,
+    prompt: string,
+    hooks: SessionRunHooks,
+    signal: AbortSignal,
+  ): Promise<SessionRunResult> {
+    this.assertWritable();
+    this.persistence.getSession(id);
+    if (this.running.has(id)) return Promise.reject(new Error('已有任务正在执行'));
+    this.running.add(id);
+    const task = this.executeRun(id, prompt, hooks, signal);
+    this.activeRunTasks.add(task);
+    const cleanup = (): void => {
+      this.running.delete(id);
+      this.activeRunTasks.delete(task);
+    };
+    void task.then(cleanup, cleanup);
+    return await task;
   }
 
   /** 删除空闲会话，运行中的会话必须先由调用方中断并等待退出。 */
   remove(id: string): void {
+    this.assertWritable();
     if (this.running.has(id)) throw new Error('请先停止正在执行的任务');
+    if ((this.sessionExtractionTasks.get(id)?.size ?? 0) > 0) {
+      throw new Error('请先等待会话记忆提取完成');
+    }
     this.persistence.deleteSession(id);
   }
 
@@ -326,6 +395,7 @@ export class SessionService {
     id: string,
     signal: AbortSignal,
   ): Promise<StoredMemoryCandidate[]> {
+    this.assertWritable();
     if (this.running.has(id)) throw new Error('已有任务正在执行');
     const session = this.persistence.getSession(id);
     const messages = this.persistence.loadAgentMessages(id);
@@ -380,7 +450,7 @@ export class SessionService {
     }
     if (sourceTurn === undefined) throw new Error('会话普通任务与显示历史不一致');
 
-    return this.trackExtraction(this.memories.extractTurn({
+    return this.trackExtraction(id, this.memories.extractTurn({
       workspace: session.workspace,
       sessionId: id,
       sourceTurn,
@@ -391,8 +461,19 @@ export class SessionService {
     }));
   }
 
-  /** 等待当前已经启动的全部后台记忆提取完成。 */
-  async close(): Promise<void> {
-    await Promise.allSettled([...this.extractionTasks]);
+  /** 先等待前台任务，再等待这些任务派生出的全部记忆提取。 */
+  private async waitForActiveTasks(): Promise<void> {
+    await Promise.allSettled([...this.activeRunTasks]);
+    while (this.extractionTasks.size > 0) {
+      await Promise.allSettled([...this.extractionTasks]);
+    }
+  }
+
+  /** 进入关闭态并等待已启动的前台任务及其派生提取完成。 */
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    this.closePromise = this.waitForActiveTasks();
+    return this.closePromise;
   }
 }

@@ -335,6 +335,48 @@ export class PersistenceStore {
     return Number(row?.sequence ?? 0);
   }
 
+  /** 在当前事务内按严格序号追加已校验的 agent 消息。 */
+  private insertAgentMessageRows(
+    sessionId: string,
+    messages: ChatCompletionMessageParam[],
+    createdAt?: number,
+  ): void {
+    let sequence = this.nextSequence('agentMessages', sessionId);
+    const insert = this.database.prepare(`
+      INSERT INTO agentMessages (id, sessionId, sequence, payloadJson, createdAt)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    for (const message of messages) {
+      insert.run(
+        randomUUID(),
+        sessionId,
+        sequence,
+        JSON.stringify(message),
+        createdAt ?? Date.now(),
+      );
+      sequence += 1;
+    }
+  }
+
+  /** 在当前事务内按严格序号追加一条显示消息。 */
+  private insertDisplayMessageRow(
+    sessionId: string,
+    message: NewDisplayMessage,
+  ): void {
+    const sequence = this.nextSequence('displayMessages', sessionId);
+    this.database.prepare(`
+      INSERT INTO displayMessages (id, sessionId, sequence, role, content, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      message.id,
+      sessionId,
+      sequence,
+      message.role,
+      message.content,
+      message.createdAt,
+    );
+  }
+
   /** 校验 patch 字段及运行时值并更新已有会话，空 patch 保持无操作。 */
   private applySessionPatch(id: string, patch: SessionPatch): void {
     for (const key of Object.keys(patch)) {
@@ -424,29 +466,8 @@ export class PersistenceStore {
     const parsedAgent = persistedAgentMessageSchema.parse(agent);
     this.transaction(() => {
       this.assertSessionExists(sessionId);
-      const displaySequence = this.nextSequence('displayMessages', sessionId);
-      const agentSequence = this.nextSequence('agentMessages', sessionId);
-      this.database.prepare(`
-        INSERT INTO displayMessages (id, sessionId, sequence, role, content, createdAt)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(
-        display.id,
-        sessionId,
-        displaySequence,
-        display.role,
-        display.content,
-        display.createdAt,
-      );
-      this.database.prepare(`
-        INSERT INTO agentMessages (id, sessionId, sequence, payloadJson, createdAt)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(
-        randomUUID(),
-        sessionId,
-        agentSequence,
-        JSON.stringify(parsedAgent),
-        display.createdAt,
-      );
+      this.insertDisplayMessageRow(sessionId, display);
+      this.insertAgentMessageRows(sessionId, [parsedAgent], display.createdAt);
       this.database.prepare(`
         UPDATE sessions SET turns = turns + 1, status = ? WHERE id = ?
       `).run('running', sessionId);
@@ -480,15 +501,7 @@ export class PersistenceStore {
     const parsedMessages = messages.map((message) => persistedAgentMessageSchema.parse(message));
     this.transaction(() => {
       this.assertSessionExists(sessionId);
-      let sequence = this.nextSequence('agentMessages', sessionId);
-      const insert = this.database.prepare(`
-        INSERT INTO agentMessages (id, sessionId, sequence, payloadJson, createdAt)
-        VALUES (?, ?, ?, ?, ?)
-      `);
-      for (const message of parsedMessages) {
-        insert.run(randomUUID(), sessionId, sequence, JSON.stringify(message), Date.now());
-        sequence += 1;
-      }
+      this.insertAgentMessageRows(sessionId, parsedMessages);
     });
   }
 
@@ -500,18 +513,23 @@ export class PersistenceStore {
   ): void {
     this.transaction(() => {
       this.assertSessionExists(sessionId);
-      const sequence = this.nextSequence('displayMessages', sessionId);
-      this.database.prepare(`
-        INSERT INTO displayMessages (id, sessionId, sequence, role, content, createdAt)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(
-        message.id,
-        sessionId,
-        sequence,
-        message.role,
-        message.content,
-        message.createdAt,
-      );
+      this.insertDisplayMessageRow(sessionId, message);
+      this.applySessionPatch(sessionId, patch);
+    });
+  }
+
+  /** 原子写入最终 agent/display 消息并完成会话状态更新。 */
+  completeTurn(
+    sessionId: string,
+    agentMessage: ChatCompletionMessageParam,
+    displayMessage: NewDisplayMessage,
+    patch: SessionPatch,
+  ): void {
+    const parsedAgentMessage = persistedAgentMessageSchema.parse(agentMessage);
+    this.transaction(() => {
+      this.assertSessionExists(sessionId);
+      this.insertAgentMessageRows(sessionId, [parsedAgentMessage], displayMessage.createdAt);
+      this.insertDisplayMessageRow(sessionId, displayMessage);
       this.applySessionPatch(sessionId, patch);
     });
   }

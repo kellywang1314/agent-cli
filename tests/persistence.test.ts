@@ -575,6 +575,52 @@ describe('PersistenceStore session CRUD', () => {
     store.close();
   });
 
+  it('完成轮次的显示消息写入失败时回滚最终 agent 消息和 idle 状态', async () => {
+    const databasePath = await createDatabasePath();
+    const store = new PersistenceStore(databasePath);
+    const session = buildSession();
+    store.createSession(session);
+    store.beginTurn(
+      session.id,
+      buildDisplayMessage(),
+      { role: 'user', content: '模型输入' },
+    );
+    getTestDatabase(store).exec(`
+      CREATE TRIGGER failTerminalDisplayInsert
+      BEFORE INSERT ON displayMessages
+      WHEN NEW.role = 'assistant'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced terminal display failure');
+      END;
+    `);
+
+    expect(() => store.completeTurn(
+      session.id,
+      { role: 'assistant', content: '最终回答' },
+      buildDisplayMessage({
+        id: 'display-assistant',
+        role: 'assistant',
+        content: '最终回答',
+        createdAt: 3,
+      }),
+      { status: 'idle', updatedAt: 3 },
+    )).toThrow('forced terminal display failure');
+
+    expect(store.loadAgentMessages(session.id)).toEqual([
+      { role: 'user', content: '模型输入' },
+    ]);
+    expect(store.loadDisplayMessages(session.id)).toEqual([{
+      ...buildDisplayMessage(),
+      sessionId: session.id,
+      sequence: 0,
+    }]);
+    expect(store.getSession(session.id)).toMatchObject({
+      status: 'running',
+      updatedAt: 1,
+    });
+    store.close();
+  });
+
   it('按 workspace 和 clientType 组合查询并稳定排序', async () => {
     const databasePath = await createDatabasePath();
     const store = new PersistenceStore(databasePath);

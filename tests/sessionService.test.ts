@@ -1,6 +1,7 @@
 import { mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, expect, it, vi } from 'vitest';
 import { loadConfig } from '../src/config/loadConfig.js';
 import { MemoryService } from '../src/memory/MemoryService.js';
@@ -34,7 +35,11 @@ function createSessionProvider(
 }
 
 /** 创建真实临时数据库、工作区和共享服务。 */
-async function setupSessionTest(provider: ModelProvider, tools: ToolExecutor) {
+async function setupSessionTest(
+  provider: ModelProvider,
+  tools: ToolExecutor,
+  sanitize: (value: string) => string = (value) => value,
+) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'agent-session-'));
   cleanups.push(() => rm(directory, { recursive: true, force: true }));
   const config = loadConfig({
@@ -44,8 +49,8 @@ async function setupSessionTest(provider: ModelProvider, tools: ToolExecutor) {
   }, {});
   const store = new PersistenceStore(config.databasePath);
   cleanups.push(async () => store.close());
-  const memoryService = new MemoryService(store, provider, (value) => value);
-  const service = new SessionService(config, provider, tools, store, memoryService, (value) => value);
+  const memoryService = new MemoryService(store, provider, sanitize);
+  const service = new SessionService(config, provider, tools, store, memoryService, sanitize);
   const sessionId = await service.create('web', directory);
   const hooks = {
     onAgentEvent: () => {},
@@ -54,6 +59,11 @@ async function setupSessionTest(provider: ModelProvider, tools: ToolExecutor) {
     confirm: async () => true,
   };
   return { store, service, memoryService, sessionId, hooks, directory };
+}
+
+/** 读取测试专用底层数据库，以注入事务中途失败。 */
+function getTestDatabase(store: PersistenceStore): DatabaseSync {
+  return (store as unknown as { database: DatabaseSync }).database;
 }
 
 it('先持久化用户消息再调用模型，并在完成后启动记忆提取', async () => {
@@ -75,6 +85,97 @@ it('先持久化用户消息再调用模型，并在完成后启动记忆提取'
   expect(result.content).toBe('完成');
   expect(order[0]).toBe('persist');
   await expect(result.memoryExtraction).resolves.toEqual([]);
+});
+
+it('最终 display 写入失败时不保留隐藏的成功 assistant 或 idle 状态', async () => {
+  const provider = createSessionProvider(async () => ({ content: '不应残留', toolCalls: [] }));
+  const tools: ToolExecutor = { getDefinitions: () => [], execute: async () => 'ok' };
+  const { store, service, sessionId, hooks } = await setupSessionTest(provider, tools);
+  getTestDatabase(store).exec(`
+    CREATE TRIGGER failTerminalDisplayInsert
+    BEFORE INSERT ON displayMessages
+    WHEN NEW.role = 'assistant'
+    BEGIN
+      SELECT RAISE(ABORT, 'forced terminal display failure');
+    END;
+  `);
+
+  await expect(service.run(
+    sessionId,
+    '任务',
+    hooks,
+    new AbortController().signal,
+  )).rejects.toThrow('forced terminal display failure');
+
+  expect(store.loadAgentMessages(sessionId)).toEqual([
+    { role: 'user', content: '任务' },
+  ]);
+  expect(store.loadDisplayMessages(sessionId).map(({ role }) => role))
+    .toEqual(['user', 'notice']);
+  expect(store.getSession(sessionId).status).toBe('failed');
+});
+
+it('最终 agent 和 display 消息各自只执行一次脱敏', async () => {
+  const provider = createSessionProvider(async () => ({ content: '完成', toolCalls: [] }));
+  const tools: ToolExecutor = { getDefinitions: () => [], execute: async () => 'ok' };
+  const sanitize = (value: string): string => `[${value}]`;
+  const { store, service, sessionId, hooks } = await setupSessionTest(
+    provider,
+    tools,
+    sanitize,
+  );
+
+  const result = await service.run(sessionId, '任务', hooks, new AbortController().signal);
+
+  expect(result.content).toBe('[完成]');
+  expect(store.loadAgentMessages(sessionId).at(-1)).toEqual({
+    role: 'assistant',
+    content: '[完成]',
+  });
+  expect(store.loadDisplayMessages(sessionId).at(-1)?.content).toBe('[完成]');
+});
+
+it('观察 Hook 抛错不改变成功结果或写入失败 notice', async () => {
+  const provider = createSessionProvider(async () => ({ content: '完成', toolCalls: [] }));
+  const tools: ToolExecutor = { getDefinitions: () => [], execute: async () => 'ok' };
+  const { store, service, sessionId, hooks } = await setupSessionTest(provider, tools);
+  const observerError = new Error('observer failed');
+
+  const result = await service.run(sessionId, '任务', {
+    ...hooks,
+    onAgentEvent: () => { throw observerError; },
+    onDisplayMessage: () => { throw observerError; },
+    onStatus: () => { throw observerError; },
+  }, new AbortController().signal);
+
+  expect(result.content).toBe('完成');
+  expect(store.getSession(sessionId).status).toBe('idle');
+  expect(store.loadDisplayMessages(sessionId).map(({ role }) => role))
+    .toEqual(['user', 'assistant']);
+});
+
+it('confirm Hook 属于业务输入，其异常继续传播到任务失败路径', async () => {
+  const confirmError = new Error('confirm failed');
+  const provider = createSessionProvider(async () => {
+    throw new Error('图片任务不应调用聊天接口');
+  });
+  const tools: ToolExecutor = {
+    getDefinitions: () => [],
+    execute: async (_name, _input, context) => {
+      await context.confirm({ title: '确认', detail: '详情' }, context.signal);
+      return { path: 'generated/test.png' };
+    },
+  };
+  const { store, service, sessionId, hooks } = await setupSessionTest(provider, tools);
+
+  await expect(service.run(sessionId, '/image test', {
+    ...hooks,
+    confirm: async () => { throw confirmError; },
+  }, new AbortController().signal)).rejects.toBe(confirmError);
+
+  expect(store.getSession(sessionId).status).toBe('failed');
+  expect(store.loadDisplayMessages(sessionId).map(({ role }) => role))
+    .toEqual(['user', 'notice']);
 });
 
 it('工具声明在执行前落库，工具结果写入失败时不请求下一轮', async () => {
@@ -268,8 +369,90 @@ it('同一会话运行期间拒绝并发执行和删除，并在结束后释放'
   )).rejects.toThrow('已有任务正在执行');
   expect(() => service.remove(sessionId)).toThrow('请先停止正在执行的任务');
   finish({ content: '完成', toolCalls: [] });
-  await firstRun;
+  const result = await firstRun;
+  await result.memoryExtraction;
   expect(() => service.remove(sessionId)).not.toThrow();
+});
+
+it('记忆提取尚未 settled 时拒绝删除对应会话', async () => {
+  const provider = createSessionProvider(async () => ({ content: '完成', toolCalls: [] }));
+  const tools: ToolExecutor = { getDefinitions: () => [], execute: async () => 'ok' };
+  const { service, memoryService, sessionId, hooks } = await setupSessionTest(provider, tools);
+  let finishExtraction!: () => void;
+  vi.spyOn(memoryService, 'extractTurn').mockImplementation(async () => {
+    await new Promise<void>((resolve) => { finishExtraction = resolve; });
+    return [];
+  });
+
+  const result = await service.run(sessionId, '任务', hooks, new AbortController().signal);
+  expect(() => service.remove(sessionId)).toThrow('请先等待会话记忆提取完成');
+
+  finishExtraction();
+  await result.memoryExtraction;
+  expect(() => service.remove(sessionId)).not.toThrow();
+});
+
+it('close 先等待前台 run 再等待其派生提取，并拒绝新的写操作', async () => {
+  let finishRun!: (reply: ChatReply) => void;
+  const provider = createSessionProvider(() => new Promise<ChatReply>((resolve) => {
+    finishRun = resolve;
+  }));
+  const tools: ToolExecutor = { getDefinitions: () => [], execute: async () => 'ok' };
+  const { service, memoryService, sessionId, hooks, directory } =
+    await setupSessionTest(provider, tools);
+  let finishExtraction!: () => void;
+  vi.spyOn(memoryService, 'extractTurn').mockImplementation(async () => {
+    await new Promise<void>((resolve) => { finishExtraction = resolve; });
+    return [];
+  });
+
+  const running = service.run(sessionId, '任务', hooks, new AbortController().signal);
+  await vi.waitFor(() => expect(finishRun).toBeTypeOf('function'));
+  let closed = false;
+  const closing = service.close().then(() => { closed = true; });
+  await Promise.resolve();
+  const closedBeforeRun = closed;
+  const runAfterClose = service.run(
+    sessionId,
+    '关闭后的任务',
+    hooks,
+    new AbortController().signal,
+  ).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  let retryError: unknown;
+  let removeError: unknown;
+  try {
+    service.retryMemoryExtraction(sessionId, new AbortController().signal);
+  } catch (error) {
+    retryError = error;
+  }
+  try {
+    service.remove(sessionId);
+  } catch (error) {
+    removeError = error;
+  }
+  const createAfterClose = service.create('web', directory).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+
+  finishRun({ content: '完成', toolCalls: [] });
+  await vi.waitFor(() => expect(finishExtraction).toBeTypeOf('function'));
+  await Promise.resolve();
+  const closedBeforeExtraction = closed;
+  finishExtraction();
+  const result = await running;
+  await result.memoryExtraction;
+  await closing;
+
+  expect(closedBeforeRun).toBe(false);
+  expect(closedBeforeExtraction).toBe(false);
+  await expect(runAfterClose).resolves.toMatchObject({ message: '会话服务正在关闭' });
+  expect(retryError).toMatchObject({ message: '会话服务正在关闭' });
+  expect(removeError).toMatchObject({ message: '会话服务正在关闭' });
+  await expect(createAfterClose).resolves.toMatchObject({ message: '会话服务正在关闭' });
 });
 
 it('重试时跳过最后一轮不完整普通任务且不混入该轮工具结果', async () => {

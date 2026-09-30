@@ -55,6 +55,7 @@ describe('AgentLoop', () => {
   it('恢复历史并在每轮请求中注入最新动态记忆，仅持久化本轮新增消息', async () => {
     const snapshots: ChatCompletionMessageParam[][] = [];
     const appendedBatches: ChatCompletionMessageParam[][] = [];
+    const appendPhases: string[] = [];
     const initialMessages: ChatCompletionMessageParam[] = [
       { role: 'user', content: '历史问题' },
       { role: 'assistant', content: '历史回答' },
@@ -73,7 +74,10 @@ describe('AgentLoop', () => {
       maxRounds: 3,
       initialMessages,
       getRuntimeInstructions: async () => runtimeInstructions,
-      onMessagesAppended: async (messages) => { appendedBatches.push(messages); },
+      onMessagesAppended: async (messages, phase) => {
+        appendedBatches.push(messages);
+        appendPhases.push(phase);
+      },
     });
     if (initialMessages[0]?.role === 'user') initialMessages[0].content = '已被外部修改';
 
@@ -93,6 +97,7 @@ describe('AgentLoop', () => {
     ]);
     expect(appendedBatches.flat().map((message) => message.role))
       .toEqual(['user', 'assistant', 'tool', 'assistant']);
+    expect(appendPhases).toEqual(['intermediate', 'intermediate', 'intermediate', 'terminal']);
     expect(agent.getConversationMessages().slice(0, 2)).toEqual([
       { role: 'user', content: '历史问题' },
       { role: 'assistant', content: '历史回答' },
@@ -281,9 +286,15 @@ describe('AgentLoop', () => {
 
   it('轮次上限返回明确提示，保留配对的工具消息', async () => {
     const provider = createProvider([{ content: '', toolCalls: [{ id: '1', name: 'read', arguments: '{}' }] }]);
-    const agent = new AgentLoop(provider, createExecutor(async () => 'ok'), { systemPrompt: '', maxRounds: 1 });
+    const appendPhases: string[] = [];
+    const agent = new AgentLoop(provider, createExecutor(async () => 'ok'), {
+      systemPrompt: '',
+      maxRounds: 1,
+      onMessagesAppended: async (_messages, phase) => { appendPhases.push(phase); },
+    });
     expect(await agent.run('任务', createContext(provider))).toContain('轮次');
     expect(agent.getMessages().some((message) => message.role === 'tool')).toBe(true);
+    expect(appendPhases.at(-1)).toBe('terminal');
   });
 
   it('工具抛错后仍能完成最终回答，并对观察结果脱敏', async () => {
