@@ -1,11 +1,15 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { redactSecrets, type AgentConfig } from '../config/loadConfig.js';
+import { MemoryService } from '../memory/MemoryService.js';
+import { PersistenceStore } from '../persistence/PersistenceStore.js';
 import { AidpProvider } from '../providers/AidpProvider.js';
 import type { ModelProvider } from '../providers/types.js';
+import { SessionService } from '../sessions/SessionService.js';
+import { ToolRegistry } from '../tools/ToolRegistry.js';
 import { SessionStore } from './sessions.js';
 import type { WebEvent } from './types.js';
 
@@ -14,6 +18,7 @@ interface ServerOptions {
   provider?: ModelProvider;
   port?: number;
   token?: string;
+  databasePath?: string;
 }
 
 const inspectSchema = z.object({
@@ -42,14 +47,32 @@ function sendJson(response: ServerResponse, status: number, value: unknown): voi
 
 /** 启动仅供本机访问的鉴权 HTTP/SSE 服务。 */
 export async function startWebServer(options: ServerOptions) {
+  const config = {
+    ...options.config,
+    workspace: await realpath(options.config.workspace),
+  };
   const token = options.token ?? randomBytes(32).toString('hex');
   const peers = new Set<ServerResponse>();
   let origin = '';
   let broadcastTimer: NodeJS.Timeout | undefined;
   let disconnectTimer: NodeJS.Timeout | undefined;
+  let closePromise: Promise<void> | undefined;
   let pendingFullState = false;
   const pendingSessionIds = new Set<string>();
-  const store = new SessionStore(options.config, options.provider ?? new AidpProvider(options.config), broadcast);
+  const persistence = new PersistenceStore(options.databasePath ?? config.databasePath);
+  persistence.recoverInterruptedWork();
+  const provider = options.provider ?? new AidpProvider(config);
+  const sanitize = (text: string): string => redactSecrets(text, [config.apiKey]);
+  const memories = new MemoryService(persistence, provider, sanitize);
+  const sessions = new SessionService(
+    config,
+    provider,
+    new ToolRegistry(),
+    persistence,
+    memories,
+    sanitize,
+  );
+  const store = new SessionStore(config, sessions, memories, broadcast);
   const assets = new Map([
     ['/', ['index.html', 'text/html; charset=utf-8']],
     ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
@@ -80,7 +103,12 @@ export async function startWebServer(options: ServerOptions) {
         writeEvent({ type: 'state', state: store.snapshot() });
       } else {
         for (const id of pendingSessionIds) {
-          try { writeEvent({ type: 'session', session: store.getSessionSnapshot(id) }); } catch { /* 会话可能已删除。 */ }
+          try {
+            writeEvent({ type: 'sessionSummary', session: store.getSessionSummary(id) });
+            writeEvent({ type: 'sessionDetail', session: store.getSessionSnapshot(id) });
+          } catch {
+            // 会话可能已删除。
+          }
         }
       }
       pendingFullState = false;
@@ -152,14 +180,19 @@ export async function startWebServer(options: ServerOptions) {
       sendJson(response, 201, { id });
       return;
     }
-    const match = /^\/api\/sessions\/([^/]+)(?:\/(message|cancel|permission|inspect))?$/.exec(url.pathname);
-    if (!match) { sendJson(response, 404, { error: '接口不存在' }); return; }
-    const id = match[1]!;
-    if (request.method === 'DELETE' && !match[2]) {
-      store.remove(id);
+    const sessionMatch = /^\/api\/sessions\/([^/]+)$/.exec(url.pathname);
+    if (request.method === 'GET' && sessionMatch) {
+      sendJson(response, 200, store.getSessionSnapshot(sessionMatch[1]!));
+      return;
+    }
+    if (request.method === 'DELETE' && sessionMatch) {
+      store.remove(sessionMatch[1]!);
       sendJson(response, 200, { ok: true });
       return;
     }
+    const match = /^\/api\/sessions\/([^/]+)\/(message|cancel|permission|inspect)$/.exec(url.pathname);
+    if (!match) { sendJson(response, 404, { error: '接口不存在' }); return; }
+    const id = match[1]!;
     if (request.method !== 'POST') { sendJson(response, 405, { error: '方法不支持' }); return; }
     const body = await readJson(request);
     if (match[2] === 'message') {
@@ -184,16 +217,25 @@ export async function startWebServer(options: ServerOptions) {
       const message = error instanceof z.ZodError ? '请求参数无效' :
         error instanceof Error ? error.message : '请求失败';
       sendJson(response, message === '审批已过期' || message === '已有任务正在执行' ? 409 : 400, {
-        error: redactSecrets(message, [options.config.apiKey, token]),
+        error: redactSecrets(message, [config.apiKey, token]),
       });
     });
   });
   server.requestTimeout = 15_000;
   server.headersTimeout = 10_000;
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(options.port ?? 4317, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); });
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(options.port ?? 4317, '127.0.0.1', () => {
+        server.removeListener('error', reject);
+        resolve();
+      });
+    });
+  } catch (error) {
+    await store.close();
+    persistence.close();
+    throw error;
+  }
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('无法获取本地服务端口');
   origin = `http://127.0.0.1:${address.port}`;
@@ -202,14 +244,23 @@ export async function startWebServer(options: ServerOptions) {
     url: `${origin}/#token=${token}`,
     store,
     /** 中断工具、关闭 SSE 与连接，并清理后台计时器。 */
-    async close(): Promise<void> {
-      for (const peer of peers) peer.destroy();
-      peers.clear();
-      await store.close();
-      clearTimeout(broadcastTimer);
-      clearTimeout(disconnectTimer);
-      await new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections(); });
-      clearTimeout(disconnectTimer);
+    close(): Promise<void> {
+      if (closePromise) return closePromise;
+      closePromise = (async () => {
+        clearTimeout(broadcastTimer);
+        clearTimeout(disconnectTimer);
+        for (const peer of peers) peer.destroy();
+        peers.clear();
+        const serverClosed = new Promise<void>((resolve) => {
+          server.close(() => resolve());
+          server.closeAllConnections();
+        });
+        store.cancelAll();
+        await store.close();
+        await serverClosed;
+        persistence.close();
+      })();
+      return closePromise;
     },
   };
 }

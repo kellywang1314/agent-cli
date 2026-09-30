@@ -1,4 +1,4 @@
-import type { WebEvent, WebState } from './types.js';
+import type { WebEvent, WebSession, WebState } from './types.js';
 
 const incomingToken = new URLSearchParams(window.location.hash.slice(1)).get('token');
 if (incomingToken) {
@@ -21,22 +21,25 @@ export async function api<T>(route: string, body?: unknown, method = body === un
 /** 订阅 SSE 快照，取消组件挂载时同步终止连接和重试。 */
 export function subscribe(
   onState: (state: WebState) => void,
+  onSession: (session: WebSession) => void,
   onConnection: (connected: boolean, error?: string) => void,
 ): () => void {
   const controller = new AbortController();
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let currentState: WebState | undefined;
-  /** 合并完整快照或单会话增量，然后交给 React。 */
+  /** 合并完整摘要或单会话摘要，并独立分发会话详情。 */
   function receive(event: WebEvent): void {
     if (event.type === 'state') {
       currentState = event.state;
-    } else if (currentState) {
-      const sessions = currentState.sessions.some((session) => session.id === event.session.id) ?
-        currentState.sessions.map((session) => session.id === event.session.id ? event.session : session) :
-        [...currentState.sessions, event.session];
+    } else if (event.type === 'sessionSummary' && currentState) {
+      const sessions = currentState.sessions.some((session) => session.id === event.session.id)
+        ? currentState.sessions.map((session) => session.id === event.session.id ? event.session : session)
+        : [...currentState.sessions, event.session];
       currentState = { ...currentState, sessions };
+    } else if (event.type === 'sessionDetail') {
+      onSession(event.session);
     }
-    if (currentState) onState(currentState);
+    if (currentState && event.type !== 'sessionDetail') onState(currentState);
   }
   /** 读取完整 SSE 事件，暂存跨网络分片的数据。 */
   async function connect(): Promise<void> {

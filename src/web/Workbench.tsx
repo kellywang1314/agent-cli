@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type KeyboardEvent, type SyntheticEvent } 
 import { api, subscribe } from './api.js';
 import { AgentMark, CopyButton, Icon, Markdown, PermissionCard } from './components.js';
 import { Inspector } from './Inspector.js';
-import type { WebState } from './types.js';
+import type { WebSession, WebState } from './types.js';
 
 const suggestions = [
   { icon: 'search', title: '读懂一个项目', detail: '从结构到核心逻辑，快速上手', prompt: '请浏览项目结构，阅读 README 和主要入口，介绍这个项目的架构与运行方式。' },
@@ -19,6 +19,7 @@ function workspaceName(workspace: string): string {
 export function Workbench() {
   const [state, setState] = useState<WebState | null>(null);
   const [activeId, setActiveId] = useState(sessionStorage.getItem('agentActiveSession') ?? '');
+  const [active, setActive] = useState<WebSession | undefined>();
   const [connected, setConnected] = useState(false);
   const [connectionError, setConnectionError] = useState('');
   const [actionError, setActionError] = useState('');
@@ -33,13 +34,20 @@ export function Workbench() {
   const followRef = useRef(true);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const pendingRef = useRef(false);
-  const active = state?.sessions.find((session) => session.id === activeId);
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
   const workspace = active?.workspace ?? state?.workspace ?? '';
 
-  useEffect(() => subscribe(setState, (ready, error) => {
-    setConnected(ready);
-    setConnectionError(error ?? '');
-  }), []);
+  useEffect(() => subscribe(
+    setState,
+    (session) => {
+      if (session.id === activeIdRef.current) setActive(session);
+    },
+    (ready, error) => {
+      setConnected(ready);
+      setConnectionError(error ?? '');
+    },
+  ), []);
   useEffect(() => {
     sessionStorage.setItem('agentActiveSession', activeId);
     setActionError('');
@@ -47,7 +55,24 @@ export function Workbench() {
     setSidebarOpen(false);
   }, [activeId]);
   useEffect(() => {
-    if (state && activeId && !state.sessions.some((session) => session.id === activeId)) setActiveId('');
+    let stale = false;
+    if (!activeId) {
+      setActive(undefined);
+      return () => { stale = true; };
+    }
+    setActive(undefined);
+    void api<WebSession>(`/api/sessions/${activeId}`).then((session) => {
+      if (!stale) setActive(session);
+    }).catch(() => {
+      if (!stale) setActionError('加载会话失败');
+    });
+    return () => { stale = true; };
+  }, [activeId]);
+  useEffect(() => {
+    if (state && activeId && !state.sessions.some((session) => session.id === activeId)) {
+      setActive(undefined);
+      setActiveId('');
+    }
   }, [state, activeId]);
   useEffect(() => {
     if (followRef.current) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
@@ -73,13 +98,12 @@ export function Workbench() {
     } finally { pendingRef.current = false; setPending(false); }
   }
 
-  /** 新建独立会话并立即刷新列表，不依赖 SSE 到达顺序。 */
+  /** 新建独立会话并按需读取详情，不依赖状态列表携带消息。 */
   async function createSession(targetWorkspace?: string): Promise<string> {
     setInput('');
     const { id } = await api<{ id: string }>('/api/sessions', { workspace: (targetWorkspace ?? workspace) || undefined });
-    const nextState = await api<WebState>('/api/state');
-    setState(nextState);
     setActiveId(id);
+    setActive(await api<WebSession>(`/api/sessions/${id}`));
     return id;
   }
 
@@ -89,11 +113,12 @@ export function Workbench() {
     const prompt = input.trim();
     if (!prompt || active?.busy || !connected) return;
     await perform(async () => {
-      const id = active?.id ?? await createSession();
+      const id = active?.id ?? (activeId || await createSession());
       await api(`/api/sessions/${id}/message`, { prompt });
       setInput('');
       followRef.current = true;
-      setState(await api<WebState>('/api/state'));
+      const session = await api<WebSession>(`/api/sessions/${id}`);
+      if (activeIdRef.current === id) setActive(session);
     });
   }
 
@@ -122,8 +147,14 @@ export function Workbench() {
     if (!window.confirm('删除这个会话？本地代码和文件不会被删除。')) return;
     void perform(async () => {
       await api(`/api/sessions/${id}`, undefined, 'DELETE');
-      setState(await api<WebState>('/api/state'));
-      if (activeId === id) setActiveId('');
+      setState((current) => current ? {
+        ...current,
+        sessions: current.sessions.filter((session) => session.id !== id),
+      } : current);
+      if (activeId === id) {
+        setActive(undefined);
+        setActiveId('');
+      }
     });
   }
 
@@ -152,14 +183,16 @@ export function Workbench() {
       }}><Icon name="folder" size={17} /><span>{workspaceName(workspace)}</span><Icon name="chevron" size={13} /></button>
       <div className="sidebar-section-label">任务记录<span>{state?.sessions.length ?? 0}</span></div>
       <nav className="session-list" aria-label="任务会话">
-        {state?.sessions.length ? [...state.sessions].reverse().map((session) =>
-          <div key={session.id} className={`session-row ${activeId === session.id ? 'selected' : ''}`}>
+        {state?.sessions.length ? [...state.sessions].reverse().map((session) => {
+          const waitingForPermission = activeId === session.id && Boolean(active?.permission);
+          return <div key={session.id} className={`session-row ${activeId === session.id ? 'selected' : ''}`}>
             <button className="session-select" onClick={() => selectSession(session.id)}>
               <span className={`session-dot ${session.busy ? 'running' : ''}`} />
-              <span><strong>{session.title}</strong><small>{workspaceName(session.workspace)} · {session.permission ? '等待确认' : session.busy ? '进行中' : '本次运行'}</small></span>
+              <span><strong>{session.title}</strong><small>{workspaceName(session.workspace)} · {waitingForPermission ? '等待确认' : session.busy ? '进行中' : '本次运行'}</small></span>
             </button>
             {!session.busy && <button className="icon-button session-delete" disabled={pending} aria-label={`删除会话 ${session.title}`} onClick={() => deleteSession(session.id)}><Icon name="trash" size={14} /></button>}
-          </div>) : <div className="no-sessions"><p>好想法，从一次对话开始。</p><span>你的任务会显示在这里</span></div>}
+          </div>;
+        }) : <div className="no-sessions"><p>好想法，从一次对话开始。</p><span>你的任务会显示在这里</span></div>}
       </nav>
       <div className="sidebar-bottom">
         <div className="local-badge"><span className={`status-dot ${connected ? '' : 'offline'}`} /><span>{connected ? '本地服务已连接' : '正在连接本地服务'}</span></div>
@@ -206,7 +239,7 @@ export function Workbench() {
           {active?.permission && <PermissionCard permission={active.permission} disabled={pending || !connected}
             onRespond={(approved) => void perform(async () => {
               await api(`/api/sessions/${active.id}/permission`, { id: active.permission!.id, approved });
-              setState(await api<WebState>('/api/state'));
+              setActive(await api<WebSession>(`/api/sessions/${active.id}`));
             })} />}
         </section>}
       </div>

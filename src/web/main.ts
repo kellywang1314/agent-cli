@@ -19,16 +19,22 @@ async function main(): Promise<void> {
     .option('chat-url', { type: 'string', describe: '完整聊天端点' })
     .option('image-url', { type: 'string', describe: '完整图片端点' })
     .option('max-rounds', { type: 'number', default: 20 })
+    .option('database-path', { type: 'string', describe: '会话与长期记忆数据库路径' })
     .strict().help().parse();
   if (!Number.isInteger(args.port) || args.port < 0 || args.port > 65535) throw new Error('端口必须是 0–65535 的整数');
   const config = loadConfig({
     workspace: args.workspace, model: args.model, imageModel: args.imageModel,
     chatUrl: args.chatUrl, imageUrl: args.imageUrl, maxRounds: args.maxRounds,
+    databasePath: args.databasePath,
   });
   config.workspace = await realpath(config.workspace);
   if (!(await stat(config.workspace)).isDirectory()) throw new Error('工作区必须是目录');
-  const server = await startWebServer({ config, port: args.port });
-  console.log(`\n  Agent · 本地工作台\n  ${server.url}\n  工作区：${redactSecrets(config.workspace, [config.apiKey])}\n\n  Ctrl+C 关闭服务。会话仅保存在本次服务内存中。\n`);
+  const server = await startWebServer({
+    config,
+    port: args.port,
+    databasePath: config.databasePath,
+  });
+  console.log(`\n  Agent · 本地工作台\n  ${server.url}\n  工作区：${redactSecrets(config.workspace, [config.apiKey])}\n\n  Ctrl+C 关闭服务。会话会持久保存在本机数据库中。\n`);
   if (args.open && process.platform === 'darwin') {
     const browser = spawn('open', [server.url], { stdio: 'ignore' });
     browser.on('error', () => console.log('  请在浏览器中打开上方完整链接。'));

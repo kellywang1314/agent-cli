@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { request as httpRequest } from 'node:http';
@@ -10,13 +10,33 @@ import { startWebServer } from '../src/web/server.js';
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
+/** 创建由测试清理的独立 SQLite 数据库路径。 */
+async function createDatabasePath(): Promise<string> {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agent-web-database-'));
+  cleanups.push(() => rm(directory, { recursive: true, force: true }));
+  return path.join(directory, 'agent.db');
+}
+
 /** 启动使用假模型和独立工作区的 HTTP 服务。 */
-async function setup(provider: ModelProvider) {
-  const workspace = await mkdtemp(path.join(os.tmpdir(), 'agent-web-'));
-  cleanups.push(() => rm(workspace, { recursive: true, force: true }));
-  await writeFile(path.join(workspace, 'README.md'), '# Web test');
-  const config = loadConfig({ apiKey: 'private-test-key', workspace }, {});
-  const server = await startWebServer({ config, provider, port: 0, token: 'test-web-token' });
+async function setup(provider: ModelProvider, databasePath?: string, existingWorkspace?: string) {
+  const workspace = existingWorkspace ?? await mkdtemp(path.join(os.tmpdir(), 'agent-web-'));
+  if (!existingWorkspace) {
+    cleanups.push(() => rm(workspace, { recursive: true, force: true }));
+    await writeFile(path.join(workspace, 'README.md'), '# Web test');
+  }
+  const targetDatabasePath = databasePath ?? await createDatabasePath();
+  const config = loadConfig({
+    apiKey: 'private-test-key',
+    workspace,
+    databasePath: targetDatabasePath,
+  }, {});
+  const server = await startWebServer({
+    config,
+    provider,
+    port: 0,
+    token: 'test-web-token',
+    databasePath: targetDatabasePath,
+  });
   cleanups.push(() => server.close());
   /** 对测试服务发起具备本地访问凭据的 JSON 请求。 */
   async function request(route: string, body?: unknown, method = body === undefined ? 'GET' : 'POST') {
@@ -38,6 +58,22 @@ async function waitForState(request: (route: string) => Promise<Response>, predi
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`等待状态超时：${JSON.stringify(state)}`);
+}
+
+/** 等待指定会话详情满足异步任务状态。 */
+async function waitForSession(
+  request: (route: string) => Promise<Response>,
+  id: string,
+  predicate: (session: any) => boolean,
+) {
+  const deadline = Date.now() + 3000;
+  let session: any;
+  while (Date.now() < deadline) {
+    session = await (await request(`/api/sessions/${id}`)).json();
+    if (predicate(session)) return session;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`等待会话超时：${JSON.stringify(session)}`);
 }
 
 /** 从 HTTP 响应中逐个读取 SSE data 事件，保留跨分片余量。 */
@@ -107,14 +143,17 @@ it('独立会话、流式事件、文件读取和任务结果均经过真实 HTT
   expect(await eventReader.read()).toMatchObject({ type: 'state' });
   expect((await request(`/api/sessions/${first.id}/message`, { prompt: 'hello' })).status).toBe(202);
   const update = await eventReader.read();
-  expect(update).toMatchObject({ type: 'session', session: { id: first.id } });
+  expect(update).toMatchObject({ type: 'sessionSummary', session: { id: first.id } });
+  expect(update.session).not.toHaveProperty('messages');
   expect(update).not.toHaveProperty('state.sessions');
   streamController.abort();
   await eventReader.reader.cancel().catch(() => {});
-  const state = await waitForState(request, (value) => value.sessions.find((item: any) => item.id === first.id)?.messages.length === 2);
-  const session = state.sessions.find((item: any) => item.id === first.id);
+  const state = await waitForState(request, (value) =>
+    value.sessions.find((item: any) => item.id === first.id)?.status === 'idle');
+  expect(state.sessions.find((item: any) => item.id === first.id)).not.toHaveProperty('messages');
+  const session = await (await request(`/api/sessions/${first.id}`)).json();
   expect(session.messages[1].content).toBe('hello [REDACTED]');
-  expect(state.sessions.find((item: any) => item.id === second.id).messages).toHaveLength(0);
+  expect((await (await request(`/api/sessions/${second.id}`)).json()).messages).toHaveLength(0);
   const file = await (await request(`/api/sessions/${first.id}/inspect`, { kind: 'file', path: 'README.md' })).json();
   expect(JSON.stringify(file)).toContain('# Web test');
   expect((await request(`/api/sessions/${first.id}/inspect`, { kind: 'runCommand' })).status).toBe(400);
@@ -136,20 +175,20 @@ it('写入等待批准，拒绝不落盘，过期审批无效，取消后可以�
   const { request, workspace } = await setup(provider);
   const { id } = await (await request('/api/sessions', {})).json();
   await request(`/api/sessions/${id}/message`, { prompt: 'write' });
-  let state = await waitForState(request, (value) => Boolean(value.sessions[0].permission));
-  const rejectedId = state.sessions[0].permission.id;
+  let session = await waitForSession(request, id, (value) => Boolean(value.permission));
+  const rejectedId = session.permission.id;
   expect((await request(`/api/sessions/${id}/permission`, { id: 'stale', approved: true })).status).toBe(409);
   await request(`/api/sessions/${id}/permission`, { id: rejectedId, approved: false });
   await waitForState(request, (value) => !value.sessions[0].busy);
   await expect(readFile(path.join(workspace, 'result.txt'))).rejects.toThrow();
   await request(`/api/sessions/${id}/message`, { prompt: 'write again' });
-  state = await waitForState(request, (value) => Boolean(value.sessions[0].permission));
+  session = await waitForSession(request, id, (value) => Boolean(value.permission));
   await request(`/api/sessions/${id}/cancel`, {});
   await waitForState(request, (value) => !value.sessions[0].busy);
-  expect((await request(`/api/sessions/${id}/permission`, { id: state.sessions[0].permission.id, approved: true })).status).toBe(409);
+  expect((await request(`/api/sessions/${id}/permission`, { id: session.permission.id, approved: true })).status).toBe(409);
   await request(`/api/sessions/${id}/message`, { prompt: 'write approved' });
-  state = await waitForState(request, (value) => Boolean(value.sessions[0].permission));
-  await request(`/api/sessions/${id}/permission`, { id: state.sessions[0].permission.id, approved: true });
+  session = await waitForSession(request, id, (value) => Boolean(value.permission));
+  await request(`/api/sessions/${id}/permission`, { id: session.permission.id, approved: true });
   await waitForState(request, (value) => !value.sessions[0].busy);
   expect(await readFile(path.join(workspace, 'result.txt'), 'utf8')).toBe('created\n');
 });
@@ -166,8 +205,9 @@ it('完整消息保留与密钥前缀相同的普通结尾', async () => {
   const { request } = await setup(provider);
   const { id } = await (await request('/api/sessions', {})).json();
   await request(`/api/sessions/${id}/message`, { prompt: 'prefix' });
-  const state = await waitForState(request, (value) => !value.sessions[0].busy && value.sessions[0].messages.length === 2);
-  expect(state.sessions[0].messages[1].content).toBe('task private-');
+  await waitForState(request, (value) => !value.sessions[0].busy && value.sessions[0].status === 'idle');
+  const session = await (await request(`/api/sessions/${id}`)).json();
+  expect(session.messages[1].content).toBe('task private-');
 });
 
 it('图片生成失败显示请求失败而不是已完成', async () => {
@@ -180,12 +220,13 @@ it('图片生成失败显示请求失败而不是已完成', async () => {
   const { request } = await setup(provider);
   const { id } = await (await request('/api/sessions', {})).json();
   await request(`/api/sessions/${id}/message`, { prompt: '/image test' });
-  let state = await waitForState(request, (value) => Boolean(value.sessions[0].permission));
-  await request(`/api/sessions/${id}/permission`, { id: state.sessions[0].permission.id, approved: true });
-  state = await waitForState(request, (value) => !value.sessions[0].busy);
-  expect(state.sessions[0].status).toBe('请求失败');
-  expect(state.sessions[0].messages.at(-1)).toMatchObject({ role: 'notice' });
-  expect(state.sessions[0].tools[0]).toMatchObject({ status: 'error' });
+  let session = await waitForSession(request, id, (value) => Boolean(value.permission));
+  await request(`/api/sessions/${id}/permission`, { id: session.permission.id, approved: true });
+  await waitForState(request, (value) => !value.sessions[0].busy);
+  session = await (await request(`/api/sessions/${id}`)).json();
+  expect(session.status).toBe('failed');
+  expect(session.messages.at(-1)).toMatchObject({ role: 'notice' });
+  expect(session.tools[0]).toMatchObject({ status: 'error' });
 });
 
 it('流式失败只记录未完成提示，不伪造模型历史', async () => {
@@ -206,11 +247,50 @@ it('流式失败只记录未完成提示，不伪造模型历史', async () => {
   const { request } = await setup(provider);
   const { id } = await (await request('/api/sessions', {})).json();
   await request(`/api/sessions/${id}/message`, { prompt: 'first' });
-  let state = await waitForState(request, (value) => !value.sessions[0].busy);
-  expect(state.sessions[0].messages.map((message: any) => message.role)).toEqual(['user', 'notice']);
-  expect(state.sessions[0].messages[1].content).toContain('partial');
+  await waitForState(request, (value) => !value.sessions[0].busy);
+  let session = await (await request(`/api/sessions/${id}`)).json();
+  expect(session.messages.map((message: any) => message.role)).toEqual(['user', 'notice']);
+  expect(session.messages[1].content).toContain('stream failed');
   await request(`/api/sessions/${id}/message`, { prompt: 'second' });
-  state = await waitForState(request, (value) => !value.sessions[0].busy && value.sessions[0].messages.length === 4);
-  expect(state.sessions[0].messages.at(-1).content).toBe('recovered');
+  await waitForState(request, (value) => !value.sessions[0].busy && value.sessions[0].status === 'idle');
+  session = await (await request(`/api/sessions/${id}`)).json();
+  expect(session.messages).toHaveLength(4);
+  expect(session.messages.at(-1).content).toBe('recovered');
   expect(JSON.stringify(observedMessages[1])).not.toContain('partial');
+});
+
+it('服务重启后只在摘要列表返回元数据并按需恢复会话详情', async () => {
+  const databasePath = await createDatabasePath();
+  const first = await setup(textProvider, databasePath);
+  const { id } = await (await first.request('/api/sessions', {})).json();
+  await first.request(`/api/sessions/${id}/message`, { prompt: 'persist me' });
+  await waitForState(first.request, (state) =>
+    state.sessions.find((item: any) => item.id === id)?.status === 'idle');
+  await first.server.close();
+
+  const second = await setup(textProvider, databasePath, first.workspace);
+  const state = await (await second.request('/api/state')).json();
+  expect(state.sessions.find((item: any) => item.id === id)).not.toHaveProperty('messages');
+  const detail = await (await second.request(`/api/sessions/${id}`)).json();
+  expect(detail.messages.map((message: any) => message.role)).toEqual(['user', 'assistant']);
+});
+
+it('服务重启后恢复其他工作区的 Web 会话', async () => {
+  const databasePath = await createDatabasePath();
+  const otherWorkspace = await mkdtemp(path.join(os.tmpdir(), 'agent-web-other-'));
+  cleanups.push(() => rm(otherWorkspace, { recursive: true, force: true }));
+  const first = await setup(textProvider, databasePath);
+  const { id } = await (await first.request('/api/sessions', {
+    workspace: otherWorkspace,
+  })).json();
+  await first.request(`/api/sessions/${id}/message`, { prompt: 'other workspace' });
+  await waitForState(first.request, (state) =>
+    state.sessions.find((item: any) => item.id === id)?.status === 'idle');
+  await first.server.close();
+
+  const second = await setup(textProvider, databasePath, first.workspace);
+  const state = await (await second.request('/api/state')).json();
+  expect(state.sessions.map((session: any) => session.id)).toContain(id);
+  const detail = await (await second.request(`/api/sessions/${id}`)).json();
+  expect(detail).toMatchObject({ id, workspace: await realpath(otherWorkspace) });
 });

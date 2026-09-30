@@ -19,7 +19,7 @@ export interface WebPermission {
   detail: string;
 }
 
-export interface WebSession {
+export interface WebSessionSummary {
   id: string;
   title: string;
   workspace: string;
@@ -28,6 +28,11 @@ export interface WebSession {
   busy: boolean;
   status: string;
   startedAt: number | null;
+  pendingMemoryCount: number;
+  memoryExtractionStatus: 'idle' | 'running' | 'failed' | 'complete';
+}
+
+export interface WebSession extends WebSessionSummary {
   messages: WebMessage[];
   response: string;
   tools: WebTool[];
@@ -38,12 +43,13 @@ export interface WebState {
   model: string;
   imageModel: string;
   workspace: string;
-  sessions: WebSession[];
+  sessions: WebSessionSummary[];
 }
 
 export type WebEvent =
   | { type: 'state'; state: WebState }
-  | { type: 'session'; session: WebSession };
+  | { type: 'sessionSummary'; session: WebSessionSummary }
+  | { type: 'sessionDetail'; session: WebSession };
 
 export interface InspectInput {
   kind: 'files' | 'file' | 'diff';
