@@ -7,8 +7,13 @@ import { loadConfig } from '../src/config/loadConfig.js';
 import type { ModelProvider } from '../src/providers/types.js';
 import {
   activateSession,
-  setActiveIfCurrent,
+  beginSessionDetailRequest,
+  clearActiveSessionIfCurrent,
+  mergeSessionSummary,
+  setActiveFromRequest,
+  setActiveFromUpdate,
 } from '../src/web/activeSession.js';
+import type { WebSession, WebState } from '../src/web/types.js';
 import { startWebServer } from '../src/web/server.js';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -116,43 +121,114 @@ const textProvider: ModelProvider = {
   async generateImage() { throw new Error('unused'); },
 };
 
-it('切换会话后丢弃旧请求和响应 ID 不匹配的详情', async () => {
+it('创建详情返回后把显式摘要合并到本地状态', () => {
+  const state: WebState = {
+    model: 'test-model',
+    imageModel: 'test-image-model',
+    workspace: '/workspace',
+    sessions: [],
+  };
+  const session: WebSession = {
+    id: 'new',
+    title: '新任务',
+    workspace: '/workspace',
+    createdAt: 1,
+    updatedAt: 2,
+    busy: false,
+    status: 'idle',
+    startedAt: null,
+    pendingMemoryCount: 0,
+    memoryExtractionStatus: 'idle',
+    messages: [{ id: 'message', role: 'user', content: 'secret', createdAt: 2 }],
+    response: 'response',
+    tools: [],
+    permission: null,
+  };
+
+  const merged = mergeSessionSummary(state, session);
+
+  expect(merged.sessions).toEqual([{
+    id: 'new',
+    title: '新任务',
+    workspace: '/workspace',
+    createdAt: 1,
+    updatedAt: 2,
+    busy: false,
+    status: 'idle',
+    startedAt: null,
+    pendingMemoryCount: 0,
+    memoryExtractionStatus: 'idle',
+  }]);
+  expect(merged.sessions[0]).not.toHaveProperty('messages');
+  expect(merged.sessions[0]).not.toHaveProperty('response');
+});
+
+it('同一会话的较新 GET 和 SSE 更新都会使旧 GET 失效', () => {
+  const activeIdRef = { current: 'same' };
+  const epochRef = { current: 0 };
+  const activeSessions: Array<{ id: string; value: string }> = [];
+  const firstRequest = beginSessionDetailRequest('same', epochRef);
+  const secondRequest = beginSessionDetailRequest('same', epochRef);
+
+  expect(setActiveFromRequest(
+    firstRequest,
+    activeIdRef,
+    epochRef,
+    { id: 'same', value: 'first GET' },
+    (current) => activeSessions.push(current),
+  )).toBe(false);
+  expect(setActiveFromRequest(
+    secondRequest,
+    activeIdRef,
+    epochRef,
+    { id: 'same', value: 'second GET' },
+    (current) => activeSessions.push(current),
+  )).toBe(true);
+
+  const staleRequest = beginSessionDetailRequest('same', epochRef);
+  expect(setActiveFromUpdate(
+    activeIdRef,
+    epochRef,
+    { id: 'same', value: 'SSE' },
+    (current) => activeSessions.push(current),
+  )).toBe(true);
+  expect(setActiveFromRequest(
+    staleRequest,
+    activeIdRef,
+    epochRef,
+    { id: 'same', value: 'stale GET' },
+    (current) => activeSessions.push(current),
+  )).toBe(false);
+
+  expect(activeSessions).toEqual([
+    { id: 'same', value: 'second GET' },
+    { id: 'same', value: 'SSE' },
+  ]);
+});
+
+it('删除等待期间切换会话不会清空新 active', () => {
   const activeIdRef = { current: '' };
+  const epochRef = { current: 0 };
   const activeIds: string[] = [];
-  const activeSessions: Array<{ id: string }> = [];
-  let resolveOld!: (session: { id: string }) => void;
-  const oldResponse = new Promise<{ id: string }>((resolve) => {
-    resolveOld = resolve;
-  });
+  activateSession('A', activeIdRef, epochRef, (id) => activeIds.push(id));
 
-  activateSession('old', activeIdRef, (id) => activeIds.push(id));
-  const oldUpdate = oldResponse.then((session) => {
-    setActiveIfCurrent(
-      'old',
-      activeIdRef,
-      session,
-      (current) => activeSessions.push(current),
-    );
-  });
-  activateSession('new', activeIdRef, (id) => activeIds.push(id));
-  setActiveIfCurrent(
-    'new',
-    activeIdRef,
-    { id: 'new' },
-    (current) => activeSessions.push(current),
-  );
-  setActiveIfCurrent(
-    'new',
-    activeIdRef,
-    { id: 'other' },
-    (current) => activeSessions.push(current),
-  );
-  resolveOld({ id: 'old' });
-  await oldUpdate;
+  activateSession('B', activeIdRef, epochRef, (id) => activeIds.push(id));
 
-  expect(activeIdRef.current).toBe('new');
-  expect(activeIds).toEqual(['old', 'new']);
-  expect(activeSessions).toEqual([{ id: 'new' }]);
+  expect(clearActiveSessionIfCurrent(
+    'A',
+    activeIdRef,
+    epochRef,
+    (id) => activeIds.push(id),
+  )).toBe(false);
+  expect(activeIdRef.current).toBe('B');
+  expect(clearActiveSessionIfCurrent(
+    'B',
+    activeIdRef,
+    epochRef,
+    (id) => activeIds.push(id),
+  )).toBe(true);
+  expect(activeIdRef.current).toBe('');
+  expect(activeIds).toEqual(['A', 'B', '']);
 });
 
 it('拒绝未鉴权、跨域和错误 Host 请求，不泄漏配置密钥', async () => {
@@ -172,6 +248,48 @@ it('拒绝未鉴权、跨域和错误 Host 请求，不泄漏配置密钥', asyn
   const state = await (await request('/api/state')).text();
   expect(state).not.toContain('private-test-key');
   expect(state).not.toContain('test-web-token');
+});
+
+it('同批 full-state 后仍按顺序发送存活会话详情', async () => {
+  const provider: ModelProvider = {
+    /** 保持任务运行，确保测试只观察同一广播批次。 */
+    async chat(_messages, _tools, _onText, signal) {
+      return await new Promise((_, reject) => {
+        const abort = (): void => reject(signal.reason);
+        if (signal.aborted) abort();
+        else signal.addEventListener('abort', abort, { once: true });
+      });
+    },
+    generateImage: textProvider.generateImage,
+  };
+  const { request, server } = await setup(provider);
+  const streamController = new AbortController();
+  const events = await fetch(`${server.origin}/api/events`, {
+    headers: { authorization: 'Bearer test-web-token' },
+    signal: streamController.signal,
+  });
+  const eventReader = createSseReader(events);
+  expect(await eventReader.read()).toMatchObject({ type: 'state' });
+
+  const { id } = await (await request('/api/sessions', {})).json();
+  await request(`/api/sessions/${id}/message`, { prompt: '保持运行' });
+
+  try {
+    expect(await eventReader.read()).toMatchObject({
+      type: 'state',
+      state: { sessions: expect.arrayContaining([expect.objectContaining({ id })]) },
+    });
+    const detail = await Promise.race([
+      eventReader.read(),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('等待 sessionDetail 超时')), 500);
+      }),
+    ]);
+    expect(detail).toMatchObject({ type: 'sessionDetail', session: { id } });
+  } finally {
+    streamController.abort();
+    await eventReader.reader.cancel().catch(() => {});
+  }
 });
 
 it('独立会话、流式事件、文件读取和任务结果均经过真实 HTTP 接口', async () => {

@@ -101,14 +101,15 @@ export async function startWebServer(options: ServerOptions) {
       }
       if (pendingFullState) {
         writeEvent({ type: 'state', state: store.snapshot() });
-      } else {
-        for (const id of pendingSessionIds) {
-          try {
+      }
+      for (const id of pendingSessionIds) {
+        try {
+          if (!pendingFullState) {
             writeEvent({ type: 'sessionSummary', session: store.getSessionSummary(id) });
-            writeEvent({ type: 'sessionDetail', session: store.getSessionSnapshot(id) });
-          } catch {
-            // 会话可能已删除。
           }
+          writeEvent({ type: 'sessionDetail', session: store.getSessionSnapshot(id) });
+        } catch {
+          // 会话可能已删除。
         }
       }
       pendingFullState = false;

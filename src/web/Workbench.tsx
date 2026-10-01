@@ -1,5 +1,13 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type SyntheticEvent } from 'react';
-import { activateSession, setActiveIfCurrent } from './activeSession.js';
+import {
+  activateSession,
+  beginSessionDetailRequest,
+  clearActiveSessionIfCurrent,
+  isSessionDetailRequestCurrent,
+  mergeSessionSummary,
+  setActiveFromRequest,
+  setActiveFromUpdate,
+} from './activeSession.js';
 import { api, subscribe } from './api.js';
 import { AgentMark, CopyButton, Icon, Markdown, PermissionCard } from './components.js';
 import { Inspector } from './Inspector.js';
@@ -36,12 +44,13 @@ export function Workbench() {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const pendingRef = useRef(false);
   const activeIdRef = useRef(activeId);
+  const activeEpochRef = useRef(0);
   const workspace = active?.workspace ?? state?.workspace ?? '';
 
   useEffect(() => subscribe(
     setState,
     (session) => {
-      setActiveIfCurrent(session.id, activeIdRef, session, setActive);
+      setActiveFromUpdate(activeIdRef, activeEpochRef, session, setActive);
     },
     (ready, error) => {
       setConnected(ready);
@@ -61,18 +70,29 @@ export function Workbench() {
       setActive(undefined);
       return () => { stale = true; };
     }
+    const request = beginSessionDetailRequest(targetId, activeEpochRef);
     setActive(undefined);
     void api<WebSession>(`/api/sessions/${targetId}`).then((session) => {
-      if (!stale) setActiveIfCurrent(targetId, activeIdRef, session, setActive);
+      if (!stale) setActiveFromRequest(
+        request,
+        activeIdRef,
+        activeEpochRef,
+        session,
+        setActive,
+      );
     }).catch(() => {
-      if (!stale && activeIdRef.current === targetId) setActionError('加载会话失败');
+      if (!stale && isSessionDetailRequestCurrent(
+        request,
+        activeIdRef,
+        activeEpochRef,
+      )) setActionError('加载会话失败');
     });
     return () => { stale = true; };
   }, [activeId]);
   useEffect(() => {
     if (state && activeId && !state.sessions.some((session) => session.id === activeId)) {
       setActive(undefined);
-      activateSession('', activeIdRef, setActiveId);
+      activateSession('', activeIdRef, activeEpochRef, setActiveId);
     }
   }, [state, activeId]);
   useEffect(() => {
@@ -103,9 +123,10 @@ export function Workbench() {
   async function createSession(targetWorkspace?: string): Promise<string> {
     setInput('');
     const { id } = await api<{ id: string }>('/api/sessions', { workspace: (targetWorkspace ?? workspace) || undefined });
-    activateSession(id, activeIdRef, setActiveId);
     const session = await api<WebSession>(`/api/sessions/${id}`);
-    setActiveIfCurrent(id, activeIdRef, session, setActive);
+    setState((current) => current ? mergeSessionSummary(current, session) : current);
+    activateSession(id, activeIdRef, activeEpochRef, setActiveId);
+    setActiveFromUpdate(activeIdRef, activeEpochRef, session, setActive);
     return id;
   }
 
@@ -119,8 +140,9 @@ export function Workbench() {
       await api(`/api/sessions/${id}/message`, { prompt });
       setInput('');
       followRef.current = true;
+      const request = beginSessionDetailRequest(id, activeEpochRef);
       const session = await api<WebSession>(`/api/sessions/${id}`);
-      setActiveIfCurrent(id, activeIdRef, session, setActive);
+      setActiveFromRequest(request, activeIdRef, activeEpochRef, session, setActive);
     });
   }
 
@@ -141,7 +163,7 @@ export function Workbench() {
   /** 显式切换会话时清理当前草稿，避免把任务发到错误上下文。 */
   function selectSession(id: string): void {
     setInput('');
-    activateSession(id, activeIdRef, setActiveId);
+    activateSession(id, activeIdRef, activeEpochRef, setActiveId);
   }
 
   /** 用户确认后仅删除空闲会话。 */
@@ -153,9 +175,13 @@ export function Workbench() {
         ...current,
         sessions: current.sessions.filter((session) => session.id !== id),
       } : current);
-      if (activeId === id) {
+      if (clearActiveSessionIfCurrent(
+        id,
+        activeIdRef,
+        activeEpochRef,
+        setActiveId,
+      )) {
         setActive(undefined);
-        activateSession('', activeIdRef, setActiveId);
       }
     });
   }
@@ -242,8 +268,9 @@ export function Workbench() {
             onRespond={(approved) => void perform(async () => {
               const targetId = active.id;
               await api(`/api/sessions/${targetId}/permission`, { id: active.permission!.id, approved });
+              const request = beginSessionDetailRequest(targetId, activeEpochRef);
               const session = await api<WebSession>(`/api/sessions/${targetId}`);
-              setActiveIfCurrent(targetId, activeIdRef, session, setActive);
+              setActiveFromRequest(request, activeIdRef, activeEpochRef, session, setActive);
             })} />}
         </section>}
       </div>

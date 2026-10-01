@@ -440,6 +440,68 @@ it('记忆提取尚未 settled 时拒绝删除对应会话', async () => {
   expect(() => service.remove(sessionId)).not.toThrow();
 });
 
+it('close 会中止正常任务派生的记忆提取并等待其 settled', async () => {
+  const provider = createSessionProvider(async () => ({ content: '完成', toolCalls: [] }));
+  const tools: ToolExecutor = { getDefinitions: () => [], execute: async () => 'ok' };
+  const { service, memoryService, sessionId, hooks } = await setupSessionTest(provider, tools);
+  let extractionSignal!: AbortSignal;
+  vi.spyOn(memoryService, 'extractTurn').mockImplementation(async ({ signal }) => {
+    extractionSignal = signal;
+    await new Promise<void>((_resolve, reject) => {
+      const abort = (): void => reject(signal.reason);
+      if (signal.aborted) abort();
+      else signal.addEventListener('abort', abort, { once: true });
+    });
+    return [];
+  });
+  const result = await service.run(
+    sessionId,
+    '任务',
+    hooks,
+    new AbortController().signal,
+  );
+
+  const closing = service.close();
+  await Promise.resolve();
+
+  expect(extractionSignal.aborted).toBe(true);
+  await expect(result.memoryExtraction).rejects.toBe(extractionSignal.reason);
+  await expect(closing).resolves.toBeUndefined();
+});
+
+it('重试使用内部 controller 传播调用方 abort 并清理监听器', async () => {
+  const provider = createSessionProvider(async () => ({ content: '完成', toolCalls: [] }));
+  const tools: ToolExecutor = { getDefinitions: () => [], execute: async () => 'ok' };
+  const { service, memoryService, sessionId, hooks } = await setupSessionTest(provider, tools);
+  await (await service.run(
+    sessionId,
+    '第一轮',
+    hooks,
+    new AbortController().signal,
+  )).memoryExtraction;
+  let extractionSignal!: AbortSignal;
+  vi.spyOn(memoryService, 'extractTurn').mockImplementation(async ({ signal }) => {
+    extractionSignal = signal;
+    await new Promise<void>((_resolve, reject) => {
+      const abort = (): void => reject(signal.reason);
+      if (signal.aborted) abort();
+      else signal.addEventListener('abort', abort, { once: true });
+    });
+    return [];
+  });
+  const callerController = new AbortController();
+  const removeListener = vi.spyOn(callerController.signal, 'removeEventListener');
+  const abortReason = new Error('调用方取消');
+
+  const retry = service.retryMemoryExtraction(sessionId, callerController.signal);
+  callerController.abort(abortReason);
+
+  await expect(retry).rejects.toBe(abortReason);
+  expect(extractionSignal).not.toBe(callerController.signal);
+  expect(extractionSignal.aborted).toBe(true);
+  expect(removeListener).toHaveBeenCalledWith('abort', expect.any(Function));
+});
+
 it('close 先等待前台 run 再等待其派生提取，并拒绝新的写操作', async () => {
   let finishRun!: (reply: ChatReply) => void;
   const provider = createSessionProvider(() => new Promise<ChatReply>((resolve) => {

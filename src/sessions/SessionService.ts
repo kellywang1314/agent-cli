@@ -61,6 +61,7 @@ export class SessionService {
   private readonly running = new Set<string>();
   private readonly activeRunTasks = new Set<Promise<unknown>>();
   private readonly extractionTasks = new Set<Promise<unknown>>();
+  private readonly extractionControllers = new Set<AbortController>();
   private readonly sessionExtractionTasks = new Map<string, Set<Promise<unknown>>>();
   private closing = false;
   private closePromise: Promise<void> | undefined;
@@ -164,16 +165,22 @@ export class SessionService {
   /** 跟踪后台记忆提取，并在成功或失败后释放关闭等待集合。 */
   private trackExtraction(
     sessionId: string,
+    controller: AbortController,
     task: Promise<StoredMemoryCandidate[]>,
+    cleanupSignal: () => void = () => {},
   ): Promise<StoredMemoryCandidate[]> {
     this.extractionTasks.add(task);
+    this.extractionControllers.add(controller);
     const sessionTasks = this.sessionExtractionTasks.get(sessionId) ?? new Set();
     sessionTasks.add(task);
     this.sessionExtractionTasks.set(sessionId, sessionTasks);
+    if (this.closing) controller.abort();
     const cleanup = (): void => {
       this.extractionTasks.delete(task);
+      this.extractionControllers.delete(controller);
       sessionTasks.delete(task);
       if (sessionTasks.size === 0) this.sessionExtractionTasks.delete(sessionId);
+      cleanupSignal();
     };
     void task.then(cleanup, cleanup);
     return task;
@@ -349,15 +356,19 @@ export class SessionService {
       .filter((message) => message.role === 'tool' && typeof message.content === 'string')
       .map((message) => message.content as string);
     const extractionController = new AbortController();
-    const memoryExtraction = this.trackExtraction(sessionId, this.memories.extractTurn({
-      workspace: session.workspace,
+    const memoryExtraction = this.trackExtraction(
       sessionId,
-      sourceTurn,
-      userPrompt: displayUserMessage.content,
-      assistantResponse: assistantMessage.content,
-      toolResults,
-      signal: extractionController.signal,
-    }));
+      extractionController,
+      this.memories.extractTurn({
+        workspace: session.workspace,
+        sessionId,
+        sourceTurn,
+        userPrompt: displayUserMessage.content,
+        assistantResponse: assistantMessage.content,
+        toolResults,
+        signal: extractionController.signal,
+      }),
+    );
     return { content: assistantMessage.content, memoryExtraction };
   }
 
@@ -469,15 +480,24 @@ export class SessionService {
     }
     if (sourceTurn === undefined) throw new Error('会话普通任务与显示历史不一致');
 
-    return this.trackExtraction(id, this.memories.extractTurn({
-      workspace: session.workspace,
-      sessionId: id,
-      sourceTurn,
-      userPrompt: selectedTurn.userPrompt,
-      assistantResponse: selectedTurn.assistantResponse,
-      toolResults: selectedTurn.toolResults,
-      signal,
-    }));
+    const extractionController = new AbortController();
+    const abortExtraction = (): void => extractionController.abort(signal.reason);
+    if (signal.aborted) abortExtraction();
+    else signal.addEventListener('abort', abortExtraction, { once: true });
+    return this.trackExtraction(
+      id,
+      extractionController,
+      this.memories.extractTurn({
+        workspace: session.workspace,
+        sessionId: id,
+        sourceTurn,
+        userPrompt: selectedTurn.userPrompt,
+        assistantResponse: selectedTurn.assistantResponse,
+        toolResults: selectedTurn.toolResults,
+        signal: extractionController.signal,
+      }),
+      () => signal.removeEventListener('abort', abortExtraction),
+    );
   }
 
   /** 先等待前台任务，再等待这些任务派生出的全部记忆提取。 */
@@ -492,6 +512,7 @@ export class SessionService {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
+    for (const controller of this.extractionControllers) controller.abort();
     this.closePromise = this.waitForActiveTasks();
     return this.closePromise;
   }
