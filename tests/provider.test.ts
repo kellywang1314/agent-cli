@@ -85,6 +85,13 @@ describe('配置', () => {
     expect(text).not.toContain('token-value');
   });
 
+  it('Redis URL 用户信息会被脱敏', () => {
+    const text = redactSecrets(
+      'connect redis://student:private-password@127.0.0.1:6379 failed',
+    );
+    expect(text).toBe('connect redis://[REDACTED]@127.0.0.1:6379 failed');
+  });
+
   it('流式输出暂存可能属于密钥的尾部，并在完整后替换', () => {
     const secret = 'synthetic-private-key';
     for (let end = 1; end <= secret.length; end++) {

@@ -48,7 +48,10 @@ async function main(): Promise<void> {
   const persistence = new PersistenceStore(config.databasePath);
   persistence.recoverInterruptedWork();
   const provider = new AidpProvider(config);
-  const sanitize = (text: string): string => redactSecrets(text, [config.apiKey]);
+  const sanitize = (text: string): string => redactSecrets(text, [
+    config.apiKey,
+    config.redisUrl ?? '',
+  ]);
   const cache = await createCacheService(
     config.redisUrl,
     (error) => console.error(`Redis 已降级：${sanitize(String(error))}`),
@@ -86,7 +89,16 @@ function handleFatalError(error: unknown): void {
   const args = process.argv;
   const keyIndex = args.indexOf('--api-key');
   const cliKey = keyIndex >= 0 ? args[keyIndex + 1] : args.find((value) => value.startsWith('--api-key='))?.slice(10);
-  console.error(redactSecrets(error instanceof Error ? error.message : String(error), [process.env.AIDP_API_KEY ?? '', cliKey ?? '']));
+  const redisIndex = args.indexOf('--redis-url');
+  const cliRedisUrl = redisIndex >= 0
+    ? args[redisIndex + 1]
+    : args.find((value) => value.startsWith('--redis-url='))?.slice(12);
+  console.error(redactSecrets(error instanceof Error ? error.message : String(error), [
+    process.env.AIDP_API_KEY ?? '',
+    cliKey ?? '',
+    process.env.REDIS_URL ?? '',
+    cliRedisUrl ?? '',
+  ]));
   process.exitCode = 1;
 }
 

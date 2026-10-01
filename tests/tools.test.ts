@@ -312,9 +312,12 @@ describe('命令与差异', () => {
   it('命令过滤模拟密钥并保留非零退出码和标准错误', async () => {
     vi.stubEnv('AIDP_TOOL_TEST_SECRET', 'fake-test-value');
     vi.stubEnv('OPENAI_TOOL_TEST_SECRET', 'fake-test-value');
+    vi.stubEnv('REDIS_URL', 'redis://student:private-password@127.0.0.1:6379');
     try {
-      expect(await registry.execute('runCommand', { command: 'printf "%s/%s" "${AIDP_TOOL_TEST_SECRET-unset}" "${OPENAI_TOOL_TEST_SECRET-unset}"; printf error >&2; exit 7' }, context)).toMatchObject({
-        output: 'unset/unseterror', exitCode: 7, timedOut: false,
+      expect(await registry.execute('runCommand', {
+        command: 'printf "%s/%s/%s" "${AIDP_TOOL_TEST_SECRET-unset}" "${OPENAI_TOOL_TEST_SECRET-unset}" "${REDIS_URL-unset}"; printf error >&2; exit 7',
+      }, context)).toMatchObject({
+        output: 'unset/unset/unseterror', exitCode: 7, timedOut: false,
       });
     } finally {
       vi.unstubAllEnvs();

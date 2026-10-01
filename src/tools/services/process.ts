@@ -7,9 +7,11 @@ export interface ProcessResult {
   truncated: boolean;
 }
 
-/** 构造子进程环境，移除模型凭据及可重定向 Git 的环境项。 */
+/** 构造子进程环境，移除模型、Redis 凭据及可重定向 Git 的环境项。 */
 export function createChildEnv(): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(AIDP|OPENAI|GIT_)/i.test(key)));
+  return Object.fromEntries(Object.entries(process.env).filter(
+    ([key]) => !/^(AIDP|OPENAI|REDIS|GIT_)/i.test(key),
+  ));
 }
 
 /** 启动独立进程组，限制输出和时间并在取消时杀死整个进程组。 */

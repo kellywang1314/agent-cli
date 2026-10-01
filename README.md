@@ -58,6 +58,8 @@ CLI 参数优先于环境变量。
 | `AIDP_CHAT_URL` | `--chat-url` | 下方聊天地址 |
 | `AIDP_IMAGE_URL` | `--image-url` | 下方图片地址 |
 | `AGENT_CLI_DB_PATH` | `--database-path` | macOS 应用支持目录中的 `agent.db` |
+| `REDIS_URL` | `--redis-url` | 空，表示禁用 Redis |
+| `REDIS_CACHE_TTL_SECONDS` | `--redis-cache-ttl` | 300 秒，范围 1–86400 |
 | — | `--workspace` | 当前目录 |
 | — | `--max-rounds` | 20，范围 1–100 |
 
@@ -77,6 +79,43 @@ CLI 参数优先于环境变量。
 `~/Library/Application Support/agent-cli/agent.db`
 
 可通过 `AGENT_CLI_DB_PATH` 或 `--database-path` 覆盖。数据库可能包含脱敏后的对话和代码片段，不要上传或提交该文件。删除会话不会删除已确认的项目记忆。
+
+## Redis 可选加速层
+
+Redis 只缓存模型注入所需的 active 项目记忆，SQLite 始终是唯一持久化真相源。未配置
+`REDIS_URL`、首次连接失败或运行中断开时，应用会 fail-open 回源 SQLite，会话和记忆
+管理仍可使用。
+
+读取采用 Cache-Aside：
+
+1. 先按工作区哈希查询 Redis；命中时直接使用缓存。
+2. 未命中时读取 SQLite，并使用 `SET EX` 回填带 TTL 的缓存。
+3. 接受、编辑、启停或删除记忆时，先提交 SQLite，再删除缓存 Key。
+4. TTL 是失效删除失败后的最终恢复边界；默认 300 秒。
+
+记忆变化还会发布不含正文和工作区路径的 Pub/Sub 事件，让其他工作台进程主动刷新。
+Pub/Sub 消息是瞬时通知，离线订阅者不会补收，因此它不是持久消息队列。
+
+macOS 可执行以下实验：
+
+```bash
+brew install redis
+brew services start redis
+redis-cli ping
+
+# 在 .env 配置 REDIS_URL 后启动并触发一次记忆注入
+pnpm dev --no-open
+
+# 在另一个终端观察 Key 和剩余 TTL
+redis-cli --scan --pattern 'agent-cli:v1:*'
+redis-cli TTL '<key>'
+
+# 停止 Redis 后继续使用应用，读取会自动回源 SQLite
+brew services stop redis
+```
+
+远程 Redis 应使用 `rediss://`、认证和最小权限账户。Redis 不是秘密存储，不应缓存 API
+Key、完整提示词、工具输出或未确认的记忆。
 
 ## 交互
 
@@ -124,7 +163,7 @@ CLI 参数优先于环境变量。
 
 ## 权限和运行边界
 
-文件工具会检查路径和现存父目录真实位置，拒绝目录穿越、符号链接越界和 `.git` 访问；写入前会再次校验。密钥不写入源码或日志，终端错误及回传模型的工具结果会脱敏，子进程不继承 `AIDP*` / `OPENAI*` 环境变量。
+文件工具会检查路径和现存父目录真实位置，拒绝目录穿越、符号链接越界和 `.git` 访问；写入前会再次校验。密钥不写入源码或日志，终端错误及回传模型的工具结果会脱敏，子进程不继承 `AIDP*` / `OPENAI*` / `REDIS*` 环境变量。
 
 SQLite 数据库未做全库加密，仅依赖本机用户权限保护；数据库文件默认设为 `0600`，自动创建的数据目录设为 `0700`。**Shell 不是操作系统沙箱。** 确认的命令以当前系统用户身份运行，即使 cwd 在工作区，也能访问工作区外文件、网络及本地 `.env`。只确认你理解的命令。文件工具的校验也无法完全消除恶意进程同时替换父目录的竞争条件，勿把它作为隔离不可信系统用户的安全边界。
 
@@ -138,6 +177,7 @@ src/config/loadConfig.ts      配置校验与输出脱敏
 src/providers/AidpProvider.ts  AIDP 聊天流和图片解析
 src/agent/AgentLoop.ts         历史、工具循环、取消、循环限制
 src/context/projectContext.ts 有限读取 README.md / AGENTS.md
+src/cache/                    可选 Redis 缓存、Key 与失效事件
 src/persistence/              SQLite Schema、会话与记忆持久化
 src/memory/                   记忆提取、确认、校验与动态注入
 src/sessions/                 Web/CLI 共享会话生命周期

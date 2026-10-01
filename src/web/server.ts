@@ -83,7 +83,10 @@ export async function startWebServer(options: ServerOptions) {
   const persistence = new PersistenceStore(options.databasePath ?? config.databasePath);
   persistence.recoverInterruptedWork();
   const provider = options.provider ?? new AidpProvider(config);
-  const sanitize = (text: string): string => redactSecrets(text, [config.apiKey]);
+  const sanitize = (text: string): string => redactSecrets(text, [
+    config.apiKey,
+    config.redisUrl ?? '',
+  ]);
   const cache = options.cacheService ?? await createCacheService(
     config.redisUrl,
     (error) => console.error(`Redis 已降级：${sanitize(String(error))}`),

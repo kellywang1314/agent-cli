@@ -70,6 +70,7 @@ export function redactSecrets(value: string, secrets: string[] = []): string {
     result = result.split(encodeURIComponent(secret)).join('[REDACTED]');
   }
   return result
+    .replace(/\b(rediss?:\/\/)([^@\s/]+)@/gi, '$1[REDACTED]@')
     .replace(/([?&](?:ak|api_key|apiKey|token)=)[^&\s"'<>]+/gi, '$1[REDACTED]')
     .replace(/Bearer\s+[^\s"'<>]+/gi, 'Bearer [REDACTED]');
 }

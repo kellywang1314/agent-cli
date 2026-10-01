@@ -59,6 +59,15 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-  console.error(redactSecrets(error instanceof Error ? error.message : String(error), [process.env.AIDP_API_KEY ?? '']));
+  const args = process.argv;
+  const redisIndex = args.indexOf('--redis-url');
+  const cliRedisUrl = redisIndex >= 0
+    ? args[redisIndex + 1]
+    : args.find((value) => value.startsWith('--redis-url='))?.slice(12);
+  console.error(redactSecrets(error instanceof Error ? error.message : String(error), [
+    process.env.AIDP_API_KEY ?? '',
+    process.env.REDIS_URL ?? '',
+    cliRedisUrl ?? '',
+  ]));
   process.exitCode = 1;
 });
