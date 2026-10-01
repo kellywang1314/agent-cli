@@ -22,6 +22,7 @@ export async function createCacheService(
   let connected = false;
   const command = createClient({
     url,
+    disableOfflineQueue: true,
     socket: {
       connectTimeout: 1_000,
       reconnectStrategy: (retries) => (
