@@ -3,6 +3,12 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { readFile, realpath } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import type { CacheService } from '../cache/CacheService.js';
+import {
+  memoryInvalidationChannel,
+  memoryInvalidationEventSchema,
+} from '../cache/cacheKeys.js';
+import { createCacheService } from '../cache/createCacheService.js';
 import { redactSecrets, type AgentConfig } from '../config/loadConfig.js';
 import { MemoryService } from '../memory/MemoryService.js';
 import { PersistenceStore } from '../persistence/PersistenceStore.js';
@@ -19,6 +25,7 @@ interface ServerOptions {
   port?: number;
   token?: string;
   databasePath?: string;
+  cacheService?: CacheService;
 }
 
 const inspectSchema = z.object({
@@ -77,7 +84,17 @@ export async function startWebServer(options: ServerOptions) {
   persistence.recoverInterruptedWork();
   const provider = options.provider ?? new AidpProvider(config);
   const sanitize = (text: string): string => redactSecrets(text, [config.apiKey]);
-  const memories = new MemoryService(persistence, provider, sanitize);
+  const cache = options.cacheService ?? await createCacheService(
+    config.redisUrl,
+    (error) => console.error(`Redis 已降级：${sanitize(String(error))}`),
+  );
+  const memories = new MemoryService(
+    persistence,
+    provider,
+    sanitize,
+    cache,
+    config.redisCacheTtlSeconds,
+  );
   const sessions = new SessionService(
     config,
     provider,
@@ -130,6 +147,10 @@ export async function startWebServer(options: ServerOptions) {
       pendingSessionIds.clear();
     }, 100);
   }
+
+  await cache.subscribe(memoryInvalidationChannel, (payload) => {
+    if (memoryInvalidationEventSchema.safeParse(payload).success) broadcast();
+  });
 
   /** 检查 localhost 来源和常量时间令牌，拒绝 DNS rebinding 与跨站调用。 */
   function authorized(request: IncomingMessage, response: ServerResponse): boolean {
@@ -301,6 +322,7 @@ export async function startWebServer(options: ServerOptions) {
     });
   } catch (error) {
     await store.close();
+    await cache.close();
     persistence.close();
     throw error;
   }
@@ -326,6 +348,7 @@ export async function startWebServer(options: ServerOptions) {
         store.cancelAll();
         await store.close();
         await serverClosed;
+        await cache.close();
         persistence.close();
       })();
       return closePromise;

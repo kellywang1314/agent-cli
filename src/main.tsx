@@ -4,6 +4,7 @@ import { realpath, stat } from 'node:fs/promises';
 import { render } from 'ink';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
+import { createCacheService } from './cache/createCacheService.js';
 import { loadConfig, redactSecrets } from './config/loadConfig.js';
 import { MemoryService } from './memory/MemoryService.js';
 import { PersistenceStore } from './persistence/PersistenceStore.js';
@@ -48,7 +49,17 @@ async function main(): Promise<void> {
   persistence.recoverInterruptedWork();
   const provider = new AidpProvider(config);
   const sanitize = (text: string): string => redactSecrets(text, [config.apiKey]);
-  const memories = new MemoryService(persistence, provider, sanitize);
+  const cache = await createCacheService(
+    config.redisUrl,
+    (error) => console.error(`Redis 已降级：${sanitize(String(error))}`),
+  );
+  const memories = new MemoryService(
+    persistence,
+    provider,
+    sanitize,
+    cache,
+    config.redisCacheTtlSeconds,
+  );
   const sessions = new SessionService(
     config,
     provider,
@@ -65,6 +76,7 @@ async function main(): Promise<void> {
     await app.waitUntilExit();
   } finally {
     await sessions.close();
+    await cache.close();
     persistence.close();
   }
 }

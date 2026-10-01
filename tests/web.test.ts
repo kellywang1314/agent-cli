@@ -2,7 +2,8 @@ import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { request as httpRequest } from 'node:http';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
+import type { CacheService } from '../src/cache/CacheService.js';
 import { loadConfig } from '../src/config/loadConfig.js';
 import type { ModelProvider } from '../src/providers/types.js';
 import {
@@ -29,7 +30,12 @@ async function createDatabasePath(): Promise<string> {
 }
 
 /** 启动使用假模型和独立工作区的 HTTP 服务。 */
-async function setup(provider: ModelProvider, databasePath?: string, existingWorkspace?: string) {
+async function setup(
+  provider: ModelProvider,
+  databasePath?: string,
+  existingWorkspace?: string,
+  cacheService?: CacheService,
+) {
   const workspace = existingWorkspace ?? await mkdtemp(path.join(os.tmpdir(), 'agent-web-'));
   if (!existingWorkspace) {
     cleanups.push(() => rm(workspace, { recursive: true, force: true }));
@@ -47,6 +53,7 @@ async function setup(provider: ModelProvider, databasePath?: string, existingWor
     port: 0,
     token: 'test-web-token',
     databasePath: targetDatabasePath,
+    cacheService,
   });
   cleanups.push(() => server.close());
   /** 对测试服务发起具备本地访问凭据的 JSON 请求。 */
@@ -321,6 +328,41 @@ it('拒绝未鉴权、跨域和错误 Host 请求，不泄漏配置密钥', asyn
   const state = await (await request('/api/state')).text();
   expect(state).not.toContain('private-test-key');
   expect(state).not.toContain('test-web-token');
+});
+
+it('Redis 失效事件触发完整 Web 状态刷新且关闭缓存连接', async () => {
+  let listener: ((payload: unknown) => void) | undefined;
+  const cache = {
+    getJson: vi.fn(async () => null),
+    setJson: vi.fn(async () => {}),
+    delete: vi.fn(async () => {}),
+    publish: vi.fn(async () => {}),
+    subscribe: vi.fn(async (_channel, nextListener) => {
+      listener = nextListener;
+    }),
+    close: vi.fn(async () => {}),
+  } satisfies CacheService;
+  const { server, request } = await setup(
+    textProvider,
+    undefined,
+    undefined,
+    cache,
+  );
+  const events = await request('/api/events');
+  const reader = createSseReader(events);
+  await reader.read();
+
+  listener?.({
+    version: 1,
+    resource: 'memory',
+    workspaceHash: 'a'.repeat(64),
+    action: 'invalidate',
+  });
+
+  expect((await reader.read()).type).toBe('state');
+  await reader.reader.cancel();
+  await server.close();
+  expect(cache.close).toHaveBeenCalledOnce();
 });
 
 it('同批 full-state 后仍按顺序发送存活会话详情', async () => {
