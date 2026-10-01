@@ -5,7 +5,11 @@ import { render } from 'ink';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import { createCacheService } from './cache/createCacheService.js';
-import { loadConfig, redactSecrets } from './config/loadConfig.js';
+import {
+  loadConfig,
+  redactSecrets,
+  validateRedisCliUrl,
+} from './config/loadConfig.js';
 import { MemoryService } from './memory/MemoryService.js';
 import { PersistenceStore } from './persistence/PersistenceStore.js';
 import { AidpProvider } from './providers/AidpProvider.js';
@@ -26,7 +30,11 @@ async function main(): Promise<void> {
     .option('image-url', { type: 'string', describe: '完整图片生成地址，不包含 ak' })
     .option('max-rounds', { type: 'number', describe: '每个任务的最大模型调用轮次', default: 20 })
     .option('database-path', { type: 'string', describe: '会话与长期记忆数据库路径' })
-    .option('redis-url', { type: 'string', describe: '可选 Redis 地址' })
+    .option('redis-url', {
+      type: 'string',
+      describe: '可选无认证 Redis 地址',
+      coerce: validateRedisCliUrl,
+    })
     .option('redis-cache-ttl', {
       type: 'number',
       describe: 'Redis 缓存 TTL 秒数',

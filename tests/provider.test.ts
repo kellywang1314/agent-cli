@@ -1,7 +1,12 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { once } from 'node:events';
 import { afterEach, describe, expect, it } from 'vitest';
-import { loadConfig, redactSecrets, redactStream } from '../src/config/loadConfig.js';
+import {
+  loadConfig,
+  redactSecrets,
+  redactStream,
+  validateRedisCliUrl,
+} from '../src/config/loadConfig.js';
 import { AidpProvider } from '../src/providers/AidpProvider.js';
 
 const servers: Server[] = [];
@@ -68,6 +73,14 @@ describe('配置', () => {
     expect(() => loadConfig({ apiKey: 'key' }, {
       REDIS_CACHE_TTL_SECONDS: 'not-a-number',
     })).toThrow('redisCacheTtlSeconds');
+  });
+
+  it('Redis CLI 参数拒绝凭据并允许无认证本地地址', () => {
+    expect(validateRedisCliUrl('redis://127.0.0.1:6379'))
+      .toBe('redis://127.0.0.1:6379');
+    expect(() => validateRedisCliUrl(
+      'rediss://student:private-password@redis.example.com:6380',
+    )).toThrow('REDIS_URL');
   });
 
   it('缺少密钥、错误 URL、非法轮次均给出脱敏错误', () => {

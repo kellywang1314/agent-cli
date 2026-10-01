@@ -4,7 +4,11 @@ import { spawn } from 'node:child_process';
 import { realpath, stat } from 'node:fs/promises';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
-import { loadConfig, redactSecrets } from '../config/loadConfig.js';
+import {
+  loadConfig,
+  redactSecrets,
+  validateRedisCliUrl,
+} from '../config/loadConfig.js';
 import { startWebServer } from './server.js';
 
 /** 加载本地模型配置并启动图形工作台。 */
@@ -20,7 +24,11 @@ async function main(): Promise<void> {
     .option('image-url', { type: 'string', describe: '完整图片端点' })
     .option('max-rounds', { type: 'number', default: 20 })
     .option('database-path', { type: 'string', describe: '会话与长期记忆数据库路径' })
-    .option('redis-url', { type: 'string', describe: '可选 Redis 地址' })
+    .option('redis-url', {
+      type: 'string',
+      describe: '可选无认证 Redis 地址',
+      coerce: validateRedisCliUrl,
+    })
     .option('redis-cache-ttl', {
       type: 'number',
       describe: 'Redis 缓存 TTL 秒数',

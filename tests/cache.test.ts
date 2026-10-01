@@ -73,6 +73,7 @@ describe('缓存服务', () => {
   it('首次 Redis 连接失败时停止重试并降级为空缓存', async () => {
     let initialReconnectDecision: false | number | Error | undefined;
     let disableOfflineQueue: boolean | undefined;
+    let commandTimeout: number | undefined;
     const command = {
       on: vi.fn(),
       connect: vi.fn(async () => {
@@ -87,6 +88,7 @@ describe('缓存服务', () => {
     redisMock.createClient.mockImplementation((options) => {
       reconnectStrategy = options.socket?.reconnectStrategy;
       disableOfflineQueue = options.disableOfflineQueue;
+      commandTimeout = options.commandOptions?.timeout;
       return command;
     });
     const warning = vi.fn();
@@ -96,6 +98,7 @@ describe('缓存服务', () => {
     expect(cache).toBeInstanceOf(NullCacheService);
     expect(initialReconnectDecision).toBe(false);
     expect(disableOfflineQueue).toBe(true);
+    expect(commandTimeout).toBe(1_000);
     expect(command.destroy).toHaveBeenCalledOnce();
     expect(warning).toHaveBeenCalledOnce();
   });

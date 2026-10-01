@@ -40,6 +40,16 @@ const configSchema = z.object({
 
 export type AgentConfig = z.infer<typeof configSchema>;
 
+/** 禁止在可被进程列表和 Shell 历史读取的 CLI 参数中携带 Redis 凭据。 */
+export function validateRedisCliUrl(value: string | undefined): string | undefined {
+  if (!value) return value;
+  const url = new URL(value);
+  if (url.username || url.password) {
+    throw new Error('认证 Redis 地址请通过 REDIS_URL 环境变量配置');
+  }
+  return value;
+}
+
 /** 合并参数和环境变量，校验配置且不在错误中泄漏输入值。 */
 export function loadConfig(input: ConfigInput = {}, env: NodeJS.ProcessEnv = process.env): AgentConfig {
   const model = input.model ?? env.AIDP_MODEL ?? 'gpt-5.5-2026-04-24';

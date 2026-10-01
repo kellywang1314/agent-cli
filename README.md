@@ -58,7 +58,7 @@ CLI 参数优先于环境变量。
 | `AIDP_CHAT_URL` | `--chat-url` | 下方聊天地址 |
 | `AIDP_IMAGE_URL` | `--image-url` | 下方图片地址 |
 | `AGENT_CLI_DB_PATH` | `--database-path` | macOS 应用支持目录中的 `agent.db` |
-| `REDIS_URL` | `--redis-url` | 空，表示禁用 Redis |
+| `REDIS_URL` | `--redis-url` | 空，表示禁用 Redis；CLI 仅允许无认证地址 |
 | `REDIS_CACHE_TTL_SECONDS` | `--redis-cache-ttl` | 300 秒，范围 1–86400 |
 | — | `--workspace` | 当前目录 |
 | — | `--max-rounds` | 20，范围 1–100 |
@@ -114,8 +114,9 @@ redis-cli TTL '<key>'
 brew services stop redis
 ```
 
-远程 Redis 应使用 `rediss://`、认证和最小权限账户。Redis 不是秘密存储，不应缓存 API
-Key、完整提示词、工具输出或未确认的记忆。
+远程 Redis 应使用 `rediss://`、认证和最小权限账户。认证 URL 必须通过 `REDIS_URL`
+环境变量配置，不要放入 `--redis-url`，避免泄漏到 Shell 历史或进程列表。Redis 不是秘密
+存储，不应缓存 API Key、完整提示词、工具输出或未确认的记忆。
 
 ## 交互
 
