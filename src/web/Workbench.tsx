@@ -4,7 +4,8 @@ import {
   beginSessionDetailRequest,
   clearActiveSessionIfCurrent,
   isSessionDetailRequestCurrent,
-  mergeSessionSummary,
+  mergeCreatedSessionSummary,
+  mergeServerStateWithPendingSessions,
   setActiveFromRequest,
   setActiveFromUpdate,
 } from './activeSession.js';
@@ -45,10 +46,15 @@ export function Workbench() {
   const pendingRef = useRef(false);
   const activeIdRef = useRef(activeId);
   const activeEpochRef = useRef(0);
+  const pendingCreatedIdsRef = useRef(new Set<string>());
   const workspace = active?.workspace ?? state?.workspace ?? '';
 
   useEffect(() => subscribe(
-    setState,
+    (serverState) => setState((current) => mergeServerStateWithPendingSessions(
+      serverState,
+      current,
+      pendingCreatedIdsRef.current,
+    )),
     (session) => {
       setActiveFromUpdate(activeIdRef, activeEpochRef, session, setActive);
     },
@@ -124,7 +130,11 @@ export function Workbench() {
     setInput('');
     const { id } = await api<{ id: string }>('/api/sessions', { workspace: (targetWorkspace ?? workspace) || undefined });
     const session = await api<WebSession>(`/api/sessions/${id}`);
-    setState((current) => current ? mergeSessionSummary(current, session) : current);
+    setState((current) => current ? mergeCreatedSessionSummary(
+      current,
+      session,
+      pendingCreatedIdsRef.current,
+    ) : current);
     activateSession(id, activeIdRef, activeEpochRef, setActiveId);
     setActiveFromUpdate(activeIdRef, activeEpochRef, session, setActive);
     return id;
@@ -171,6 +181,7 @@ export function Workbench() {
     if (!window.confirm('删除这个会话？本地代码和文件不会被删除。')) return;
     void perform(async () => {
       await api(`/api/sessions/${id}`, undefined, 'DELETE');
+      pendingCreatedIdsRef.current.delete(id);
       setState((current) => current ? {
         ...current,
         sessions: current.sessions.filter((session) => session.id !== id),

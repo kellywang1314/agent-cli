@@ -9,7 +9,9 @@ import {
   activateSession,
   beginSessionDetailRequest,
   clearActiveSessionIfCurrent,
+  mergeCreatedSessionSummary,
   mergeSessionSummary,
+  mergeServerStateWithPendingSessions,
   setActiveFromRequest,
   setActiveFromUpdate,
 } from '../src/web/activeSession.js';
@@ -121,14 +123,9 @@ const textProvider: ModelProvider = {
   async generateImage() { throw new Error('unused'); },
 };
 
-it('创建详情返回后把显式摘要合并到本地状态', () => {
-  const state: WebState = {
-    model: 'test-model',
-    imageModel: 'test-image-model',
-    workspace: '/workspace',
-    sessions: [],
-  };
-  const session: WebSession = {
+/** 构造可按需覆盖字段的完整 Web 会话。 */
+function buildWebSession(overrides: Partial<WebSession> = {}): WebSession {
+  return {
     id: 'new',
     title: '新任务',
     workspace: '/workspace',
@@ -139,11 +136,25 @@ it('创建详情返回后把显式摘要合并到本地状态', () => {
     startedAt: null,
     pendingMemoryCount: 0,
     memoryExtractionStatus: 'idle',
-    messages: [{ id: 'message', role: 'user', content: 'secret', createdAt: 2 }],
-    response: 'response',
+    messages: [],
+    response: '',
     tools: [],
     permission: null,
+    ...overrides,
   };
+}
+
+it('创建详情返回后把显式摘要合并到本地状态', () => {
+  const state: WebState = {
+    model: 'test-model',
+    imageModel: 'test-image-model',
+    workspace: '/workspace',
+    sessions: [],
+  };
+  const session = buildWebSession({
+    messages: [{ id: 'message', role: 'user', content: 'secret', createdAt: 2 }],
+    response: 'response',
+  });
 
   const merged = mergeSessionSummary(state, session);
 
@@ -161,6 +172,68 @@ it('创建详情返回后把显式摘要合并到本地状态', () => {
   }]);
   expect(merged.sessions[0]).not.toHaveProperty('messages');
   expect(merged.sessions[0]).not.toHaveProperty('response');
+});
+
+it('仅在服务端确认前保护本地创建的会话摘要', () => {
+  const initialState: WebState = {
+    model: 'test-model',
+    imageModel: 'test-image-model',
+    workspace: '/workspace',
+    sessions: [],
+  };
+  const session = buildWebSession({
+    title: '本地新任务',
+  });
+  const pendingCreatedIds = new Set<string>();
+  const optimisticState = mergeCreatedSessionSummary(
+    initialState,
+    session,
+    pendingCreatedIds,
+  );
+
+  const afterOldState = mergeServerStateWithPendingSessions(
+    initialState,
+    optimisticState,
+    pendingCreatedIds,
+  );
+  expect(afterOldState.sessions).toEqual(optimisticState.sessions);
+  expect(pendingCreatedIds.has('new')).toBe(true);
+
+  const confirmedState: WebState = {
+    ...initialState,
+    sessions: [{ ...optimisticState.sessions[0], title: '服务端新任务' }],
+  };
+  const afterConfirmation = mergeServerStateWithPendingSessions(
+    confirmedState,
+    afterOldState,
+    pendingCreatedIds,
+  );
+  expect(afterConfirmation).toEqual(confirmedState);
+  expect(pendingCreatedIds.has('new')).toBe(false);
+
+  const afterDeletion = mergeServerStateWithPendingSessions(
+    initialState,
+    afterConfirmation,
+    pendingCreatedIds,
+  );
+  expect(afterDeletion).toEqual(initialState);
+});
+
+it('服务端已确认的会话不会重新进入创建保护', () => {
+  const session = buildWebSession({
+    title: '服务端新任务',
+  });
+  const confirmedState = mergeSessionSummary({
+    model: 'test-model',
+    imageModel: 'test-image-model',
+    workspace: '/workspace',
+    sessions: [],
+  }, session);
+  const pendingCreatedIds = new Set<string>();
+
+  mergeCreatedSessionSummary(confirmedState, session, pendingCreatedIds);
+
+  expect(pendingCreatedIds.size).toBe(0);
 });
 
 it('同一会话的较新 GET 和 SSE 更新都会使旧 GET 失效', () => {

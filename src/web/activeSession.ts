@@ -34,6 +34,39 @@ export function mergeSessionSummary(state: WebState, session: WebSession): WebSt
   return { ...state, sessions };
 }
 
+/** 合并新建会话摘要，仅在当前服务端状态尚未包含它时登记保护。 */
+export function mergeCreatedSessionSummary(
+  state: WebState,
+  session: WebSession,
+  pendingCreatedIds: Set<string>,
+): WebState {
+  if (state.sessions.some((item) => item.id === session.id)) {
+    pendingCreatedIds.delete(session.id);
+  } else {
+    pendingCreatedIds.add(session.id);
+  }
+  return mergeSessionSummary(state, session);
+}
+
+/** 合并服务端状态，并仅保留尚未被服务端确认的本地创建摘要。 */
+export function mergeServerStateWithPendingSessions(
+  serverState: WebState,
+  currentState: WebState | null,
+  pendingCreatedIds: Set<string>,
+): WebState {
+  const serverIds = new Set(serverState.sessions.map((session) => session.id));
+  for (const id of pendingCreatedIds) {
+    if (serverIds.has(id)) pendingCreatedIds.delete(id);
+  }
+  if (!currentState || pendingCreatedIds.size === 0) return serverState;
+  const pendingSessions = currentState.sessions.filter(
+    (session) => pendingCreatedIds.has(session.id) && !serverIds.has(session.id),
+  );
+  return pendingSessions.length === 0
+    ? serverState
+    : { ...serverState, sessions: [...serverState.sessions, ...pendingSessions] };
+}
+
 /** 同步更新当前会话引用和 React 状态，避免渲染前仍读取旧 ID。 */
 export function activateSession(
   id: string,
