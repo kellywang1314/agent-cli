@@ -11,6 +11,8 @@ export interface ConfigInput {
   workspace?: string;
   maxRounds?: number;
   databasePath?: string;
+  redisUrl?: string;
+  redisCacheTtlSeconds?: number;
 }
 
 const endpointSchema = z.string().url().refine((value) => {
@@ -18,6 +20,10 @@ const endpointSchema = z.string().url().refine((value) => {
   return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password &&
     !url.searchParams.has('ak') && !url.hash;
 }, '接口必须为 HTTP(S) 地址，不包含凭据、ak 或 fragment');
+const redisUrlSchema = z.string().url().refine((value) => {
+  const url = new URL(value);
+  return ['redis:', 'rediss:'].includes(url.protocol);
+}, 'Redis 地址必须使用 redis:// 或 rediss://');
 
 const configSchema = z.object({
   apiKey: z.string().trim().min(1, '请通过 AIDP_API_KEY 配置密钥'),
@@ -28,6 +34,8 @@ const configSchema = z.object({
   workspace: z.string().min(1),
   maxRounds: z.number().int().min(1).max(100),
   databasePath: z.string().min(1),
+  redisUrl: redisUrlSchema.nullable(),
+  redisCacheTtlSeconds: z.number().int().min(1).max(86_400),
 });
 
 export type AgentConfig = z.infer<typeof configSchema>;
@@ -44,6 +52,9 @@ export function loadConfig(input: ConfigInput = {}, env: NodeJS.ProcessEnv = pro
     workspace: path.resolve(input.workspace ?? process.cwd()),
     maxRounds: input.maxRounds ?? 20,
     databasePath: path.resolve(input.databasePath ?? resolveDatabasePath(env)),
+    redisUrl: input.redisUrl ?? (env.REDIS_URL?.trim() || null),
+    redisCacheTtlSeconds: input.redisCacheTtlSeconds ??
+      Number(env.REDIS_CACHE_TTL_SECONDS ?? 300),
   });
   if (!parsed.success) {
     throw new Error(`配置错误：${parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('；')}`);

@@ -25,6 +25,12 @@ async function main(): Promise<void> {
     .option('image-url', { type: 'string', describe: '完整图片生成地址，不包含 ak' })
     .option('max-rounds', { type: 'number', describe: '每个任务的最大模型调用轮次', default: 20 })
     .option('database-path', { type: 'string', describe: '会话与长期记忆数据库路径' })
+    .option('redis-url', { type: 'string', describe: '可选 Redis 地址' })
+    .option('redis-cache-ttl', {
+      type: 'number',
+      describe: 'Redis 缓存 TTL 秒数',
+      default: 300,
+    })
     .strict()
     .version('0.1.0')
     .help()
@@ -33,6 +39,7 @@ async function main(): Promise<void> {
     workspace: args.workspace, apiKey: args.apiKey, model: args.model, imageModel: args.imageModel,
     chatUrl: args.chatUrl, imageUrl: args.imageUrl, maxRounds: args.maxRounds,
     databasePath: args.databasePath,
+    redisUrl: args.redisUrl, redisCacheTtlSeconds: args.redisCacheTtl,
   });
   config.workspace = await realpath(config.workspace);
   if (!(await stat(config.workspace)).isDirectory()) throw new Error('工作区必须是目录');

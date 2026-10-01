@@ -43,6 +43,33 @@ describe('配置', () => {
     expect(config.chatUrl).toBe('https://aidp.bytedance.net/api/modelhub/online/v2/crawl');
   });
 
+  it('读取可选 Redis 地址和有界 TTL，参数覆盖环境变量', () => {
+    const config = loadConfig({
+      apiKey: 'key',
+      redisUrl: 'redis://127.0.0.1:6380',
+      redisCacheTtlSeconds: 60,
+    }, {
+      REDIS_URL: 'redis://127.0.0.1:6379',
+      REDIS_CACHE_TTL_SECONDS: '300',
+    });
+    expect(config.redisUrl).toBe('redis://127.0.0.1:6380');
+    expect(config.redisCacheTtlSeconds).toBe(60);
+
+    const disabled = loadConfig({ apiKey: 'key' }, {});
+    expect(disabled.redisUrl).toBeNull();
+    expect(disabled.redisCacheTtlSeconds).toBe(300);
+  });
+
+  it('拒绝非 Redis 协议和超出范围的缓存 TTL', () => {
+    expect(() => loadConfig({ apiKey: 'key', redisUrl: 'https://localhost' }, {}))
+      .toThrow('redisUrl');
+    expect(() => loadConfig({ apiKey: 'key', redisCacheTtlSeconds: 0 }, {}))
+      .toThrow('redisCacheTtlSeconds');
+    expect(() => loadConfig({ apiKey: 'key' }, {
+      REDIS_CACHE_TTL_SECONDS: 'not-a-number',
+    })).toThrow('redisCacheTtlSeconds');
+  });
+
   it('缺少密钥、错误 URL、非法轮次均给出脱敏错误', () => {
     expect(() => loadConfig({}, {})).toThrow('AIDP_API_KEY');
     expect(() => loadConfig({ apiKey: 'key', maxRounds: 0 }, {})).toThrow();

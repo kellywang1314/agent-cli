@@ -20,12 +20,19 @@ async function main(): Promise<void> {
     .option('image-url', { type: 'string', describe: '完整图片端点' })
     .option('max-rounds', { type: 'number', default: 20 })
     .option('database-path', { type: 'string', describe: '会话与长期记忆数据库路径' })
+    .option('redis-url', { type: 'string', describe: '可选 Redis 地址' })
+    .option('redis-cache-ttl', {
+      type: 'number',
+      describe: 'Redis 缓存 TTL 秒数',
+      default: 300,
+    })
     .strict().help().parse();
   if (!Number.isInteger(args.port) || args.port < 0 || args.port > 65535) throw new Error('端口必须是 0–65535 的整数');
   const config = loadConfig({
     workspace: args.workspace, model: args.model, imageModel: args.imageModel,
     chatUrl: args.chatUrl, imageUrl: args.imageUrl, maxRounds: args.maxRounds,
     databasePath: args.databasePath,
+    redisUrl: args.redisUrl, redisCacheTtlSeconds: args.redisCacheTtl,
   });
   config.workspace = await realpath(config.workspace);
   if (!(await stat(config.workspace)).isDirectory()) throw new Error('工作区必须是目录');
