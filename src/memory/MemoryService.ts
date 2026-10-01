@@ -1,5 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import {
+  NullCacheService,
+  type CacheService,
+} from '../cache/CacheService.js';
+import {
+  activeMemoriesCacheKey,
+  hashWorkspace,
+  memoryInvalidationChannel,
+  storedMemoriesCacheSchema,
+} from '../cache/cacheKeys.js';
 import type { PersistenceStore } from '../persistence/PersistenceStore.js';
 import type {
   StoredMemory,
@@ -15,7 +25,6 @@ import type {
 
 const maxRuntimeMemoryCount = 50;
 const maxRuntimeInstructionBytes = 12 * 1024;
-const maxExtractionMemoryCount = 50;
 const maxExtractionMemoryBytes = 12 * 1024;
 const maxExtractionErrorBytes = 512;
 const extractionSchema = z.object({
@@ -82,7 +91,34 @@ export class MemoryService {
     private readonly store: PersistenceStore,
     private readonly provider: ModelProvider,
     private readonly sanitize: (text: string) => string,
+    private readonly cache: CacheService = new NullCacheService(),
+    private readonly cacheTtlSeconds = 300,
   ) {}
+
+  /** 从 Redis 读取启用记忆，未命中或数据无效时回源 SQLite。 */
+  private async listActiveMemories(workspace: string): Promise<StoredMemory[]> {
+    const key = activeMemoriesCacheKey(workspace);
+    const cached = await this.cache.getJson(key);
+    if (cached !== null) {
+      const parsed = storedMemoriesCacheSchema.safeParse(cached);
+      if (parsed.success) return parsed.data;
+      await this.cache.delete(key);
+    }
+    const memories = this.store.listMemories(workspace, true, maxRuntimeMemoryCount);
+    await this.cache.setJson(key, memories, this.cacheTtlSeconds);
+    return memories;
+  }
+
+  /** 在 SQLite 成功写入后依次失效共享缓存并发布无正文事件。 */
+  private async invalidateMemoryCache(workspace: string): Promise<void> {
+    await this.cache.delete(activeMemoriesCacheKey(workspace));
+    await this.cache.publish(memoryInvalidationChannel, {
+      version: 1,
+      resource: 'memory',
+      workspaceHash: hashWorkspace(workspace),
+      action: 'invalidate',
+    });
+  }
 
   /** 将任意错误转换为脱敏、单行且有字节上限的持久化错误。 */
   private createExtractionError(error: unknown): string {
@@ -127,11 +163,7 @@ export class MemoryService {
     });
 
     try {
-      const activeMemories = this.store.listMemories(
-        input.workspace,
-        true,
-        maxExtractionMemoryCount,
-      );
+      const activeMemories = await this.listActiveMemories(input.workspace);
       const prompt = createMemoryExtractionPrompt(
         selectExtractionMemories(activeMemories.map(({ content }) => content)),
         {
@@ -228,7 +260,7 @@ export class MemoryService {
   /** 返回当前工作区不超过 50 条和 12 KiB 的动态系统上下文。 */
   async buildRuntimeInstructions(workspace: string): Promise<string> {
     const selected: StoredMemory[] = [];
-    for (const memory of this.store.listMemories(workspace, true, maxRuntimeMemoryCount)) {
+    for (const memory of await this.listActiveMemories(workspace)) {
       const nextPrompt = createMemorySystemPrompt([...selected, memory]);
       if (Buffer.byteLength(nextPrompt, 'utf8') > maxRuntimeInstructionBytes) break;
       selected.push(memory);
@@ -252,11 +284,13 @@ export class MemoryService {
     }
     const candidate = this.findWorkspaceCandidate(sessionId, candidateId);
     const content = this.validateMemoryContent(decision.content ?? candidate.content);
-    return this.store.resolveMemoryCandidate(sessionId, candidateId, {
+    const memory = this.store.resolveMemoryCandidate(sessionId, candidateId, {
       action: 'accept',
       content,
       normalizedContent: normalizeMemoryContent(content),
     }, Date.now());
+    await this.invalidateMemoryCache(candidate.workspace);
+    return memory;
   }
 
   /** 返回会话工作区的候选、正式记忆和提取状态。 */
@@ -279,11 +313,15 @@ export class MemoryService {
     const validatedPatch = patch.content === undefined
       ? patch
       : { ...patch, content: this.validateMemoryContent(patch.content) };
-    return this.store.updateMemory(sessionId, memoryId, validatedPatch);
+    const memory = this.store.updateMemory(sessionId, memoryId, validatedPatch);
+    void this.invalidateMemoryCache(memory.workspace);
+    return memory;
   }
 
   /** 删除正式记忆。 */
   deleteMemory(sessionId: string, memoryId: string): void {
+    const workspace = this.store.getSession(sessionId).workspace;
     this.store.deleteMemory(sessionId, memoryId);
+    void this.invalidateMemoryCache(workspace);
   }
 }

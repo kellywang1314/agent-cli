@@ -2,6 +2,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { CacheService } from '../src/cache/CacheService.js';
+import { activeMemoriesCacheKey } from '../src/cache/cacheKeys.js';
 import {
   containsPotentialSecret,
   MemoryService,
@@ -27,6 +29,20 @@ interface Deferred<T> {
   promise: Promise<T>;
   resolve: (value: T) => void;
   reject: (reason: unknown) => void;
+}
+
+class FakeCacheService implements CacheService {
+  value: unknown | null = null;
+  readonly getJson = vi.fn(async () => this.value);
+  readonly setJson = vi.fn(async (_key: string, value: unknown) => {
+    this.value = value;
+  });
+  readonly delete = vi.fn(async () => {
+    this.value = null;
+  });
+  readonly publish = vi.fn(async () => {});
+  readonly subscribe = vi.fn(async () => {});
+  readonly close = vi.fn(async () => {});
 }
 
 /** 关闭测试数据库并清理临时目录。 */
@@ -861,6 +877,125 @@ describe('候选确认与正式记忆', () => {
 });
 
 describe('运行时记忆注入', () => {
+  it('运行时记忆缓存命中时不查询 SQLite', async () => {
+    const store = await createStore();
+    store.createSession(buildSession());
+    const cache = new FakeCacheService();
+    cache.value = [{
+      id: 'cached',
+      workspace: '/workspace/one',
+      category: 'rule',
+      content: '来自 Redis',
+      normalizedContent: '来自 redis',
+      active: true,
+      sourceSessionId: null,
+      createdAt: 1,
+      updatedAt: 1,
+    }];
+    const listMemories = vi.spyOn(store, 'listMemories');
+    const service = new MemoryService(
+      store,
+      createProvider('{"candidates":[]}'),
+      (text) => text,
+      cache,
+      60,
+    );
+
+    expect(await service.buildRuntimeInstructions('/workspace/one')).toContain('来自 Redis');
+    expect(listMemories).not.toHaveBeenCalled();
+  });
+
+  it('缓存未命中时读取 SQLite 并使用配置 TTL 回填', async () => {
+    const store = await createStore();
+    store.createSession(buildSession());
+    const memory = acceptCandidate(store, buildCandidate());
+    const cache = new FakeCacheService();
+    const listMemories = vi.spyOn(store, 'listMemories');
+    const service = new MemoryService(
+      store,
+      createProvider('{"candidates":[]}'),
+      (text) => text,
+      cache,
+      60,
+    );
+
+    expect(await service.buildRuntimeInstructions('/workspace/one'))
+      .toContain(memory!.content);
+    expect(listMemories).toHaveBeenCalledWith('/workspace/one', true, 50);
+    expect(cache.setJson).toHaveBeenCalledWith(
+      activeMemoriesCacheKey('/workspace/one'),
+      [memory],
+      60,
+    );
+  });
+
+  it('缓存结构无效时删除损坏 Key 并回源 SQLite', async () => {
+    const store = await createStore();
+    store.createSession(buildSession());
+    const memory = acceptCandidate(store, buildCandidate());
+    const cache = new FakeCacheService();
+    cache.value = { invalid: true };
+    const service = new MemoryService(
+      store,
+      createProvider('{"candidates":[]}'),
+      (text) => text,
+      cache,
+      60,
+    );
+
+    expect(await service.buildRuntimeInstructions('/workspace/one'))
+      .toContain(memory!.content);
+    expect(cache.delete).toHaveBeenCalledWith(
+      activeMemoriesCacheKey('/workspace/one'),
+    );
+    expect(cache.setJson).toHaveBeenCalledWith(
+      activeMemoriesCacheKey('/workspace/one'),
+      [memory],
+      60,
+    );
+  });
+
+  it('接受、编辑、启停和删除记忆只在 SQLite 成功后失效并发布', async () => {
+    const store = await createStore();
+    store.createSession(buildSession());
+    store.createSession(buildSession({
+      id: 'session-2',
+      workspace: '/workspace/two',
+    }));
+    store.insertMemoryCandidates([buildCandidate()]);
+    const cache = new FakeCacheService();
+    const service = new MemoryService(
+      store,
+      createProvider('{"candidates":[]}'),
+      (text) => text,
+      cache,
+      60,
+    );
+
+    const memory = await service.resolveCandidate(
+      'session-1',
+      'candidate-1',
+      { action: 'accept' },
+    );
+    expect(cache.delete).toHaveBeenCalledTimes(1);
+    expect(cache.publish).toHaveBeenCalledTimes(1);
+
+    service.updateMemory('session-1', memory!.id, { active: false });
+    service.deleteMemory('session-1', memory!.id);
+    await vi.waitFor(() => {
+      expect(cache.delete).toHaveBeenCalledTimes(3);
+      expect(cache.publish).toHaveBeenCalledTimes(3);
+    });
+
+    expect(() => service.updateMemory(
+      'session-2',
+      memory!.id,
+      { active: true },
+    )).toThrow('记忆不存在');
+    expect(cache.delete).toHaveBeenCalledTimes(3);
+    expect(cache.publish).toHaveBeenCalledTimes(3);
+  });
+
   it('仅按更新时间倒序注入 active 记忆且最多五十条', async () => {
     const store = await createStore();
     store.createSession(buildSession());
