@@ -7,12 +7,15 @@ import { redactSecrets, redactStream, type AgentConfig } from '../config/loadCon
 import type { MemoryService } from '../memory/MemoryService.js';
 import type {
   StoredDisplayMessage,
+  StoredMemory,
+  StoredMemoryCandidate,
   StoredSession,
 } from '../persistence/types.js';
 import { PermissionGate } from '../security/PermissionGate.js';
 import type { SessionService } from '../sessions/SessionService.js';
 import type { SessionSummary } from '../sessions/types.js';
 import type { PermissionRequest } from '../tools/types.js';
+import { MemoryPrompt } from './MemoryPrompt.js';
 import { PermissionPrompt } from './PermissionPrompt.js';
 
 interface AppProps {
@@ -24,6 +27,14 @@ interface AppProps {
 interface Message {
   role: '你' | 'Agent' | '提示';
   content: string;
+}
+
+interface MemoryManagerProps {
+  memories: StoredMemory[];
+  onEdit: (memoryId: string, content: string) => Promise<void>;
+  onToggle: (memory: StoredMemory) => Promise<void>;
+  onDelete: (memoryId: string) => Promise<void>;
+  onClose: () => void;
 }
 
 const helpText = [
@@ -65,6 +76,134 @@ function resolveSession(
   return matches[0]!;
 }
 
+/** 将记忆操作错误压缩为安全的单行提示。 */
+function memoryError(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error))
+    .replace(/[\u0000-\u001f\u007f-\u009f]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim() || '记忆操作失败';
+}
+
+/** 使用编号选择正式记忆，并支持编辑、启停和删除。 */
+function MemoryManager({
+  memories,
+  onEdit,
+  onToggle,
+  onDelete,
+  onClose,
+}: MemoryManagerProps) {
+  const [selectedId, setSelectedId] = useState('');
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const draftRef = useRef('');
+  const [pending, setPending] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [error, setError] = useState('');
+  const selected = memories.find(({ id }) => id === selectedId);
+
+  /** 串行执行记忆写操作并显示结果。 */
+  async function perform(action: () => Promise<void>, message: string): Promise<boolean> {
+    if (pending) return false;
+    setPending(true);
+    setError('');
+    setNotice('');
+    try {
+      await action();
+      setNotice(message);
+      return true;
+    } catch (failure) {
+      setError(memoryError(failure));
+      return false;
+    } finally {
+      setPending(false);
+    }
+  }
+
+  /** 保存编辑内容并返回详情模式。 */
+  function submitEdit(value: string): void {
+    if (!selected || !value.trim()) {
+      setError('记忆内容不能为空');
+      return;
+    }
+    void perform(() => onEdit(selected.id, value), '已更新').then((saved) => {
+      if (saved) setEditing(false);
+    });
+  }
+
+  useInput((value, key) => {
+    if (pending) return;
+    if (key.escape) {
+      if (editing) {
+        setEditing(false);
+        draftRef.current = selected?.content ?? '';
+        setDraft(selected?.content ?? '');
+      } else if (selectedId) {
+        setSelectedId('');
+        setNotice('');
+        setError('');
+      } else {
+        onClose();
+      }
+      return;
+    }
+    if (editing) return;
+    if (!selected) {
+      const index = Number(value) - 1;
+      const memory = Number.isInteger(index) ? memories[index] : undefined;
+      if (memory && index < 9) {
+        setSelectedId(memory.id);
+        draftRef.current = memory.content;
+        setDraft(memory.content);
+        setNotice('');
+        setError('');
+      }
+      return;
+    }
+    if (value.toLowerCase() === 'e') {
+      draftRef.current = selected.content;
+      setDraft(selected.content);
+      setEditing(true);
+    } else if (value.toLowerCase() === 't') {
+      void perform(
+        () => onToggle(selected),
+        selected.active ? '已停用' : '已恢复',
+      );
+    } else if (value.toLowerCase() === 'd') {
+      void perform(() => onDelete(selected.id), '已删除').then((deleted) => {
+        if (deleted) setSelectedId('');
+      });
+    }
+  });
+
+  return <Box flexDirection="column" paddingX={1}>
+    <Text bold color="cyan">项目记忆</Text>
+    {!selected ? <>
+      {memories.slice(0, 9).map((memory, index) =>
+        <Text key={memory.id}>{index + 1}. {memory.active ? '[启用]' : '[停用]'} {
+          memory.content.slice(0, 100)
+        }</Text>)}
+      {!memories.length && <Text dimColor>当前没有已确认记忆</Text>}
+      <Text dimColor>输入编号查看 · Esc 返回</Text>
+    </> : editing ? <>
+      <Text color="yellow">编辑记忆</Text>
+      <Box><Text color="green">❯ </Text><TextInput value={draft}
+        onChange={(value) => {
+          draftRef.current = value;
+          setDraft(value);
+        }}
+        onSubmit={() => submitEdit(draftRef.current)} /></Box>
+      <Text dimColor>Enter 保存 · Esc 返回</Text>
+    </> : <>
+      <Text bold>记忆详情</Text>
+      <Text>{selected.content}</Text>
+      <Text dimColor>{selected.active ? '启用中' : '已停用'} · [e] 编辑 · [t] 停用/恢复 · [d] 删除 · Esc 返回</Text>
+    </>}
+    {pending && <Text dimColor>正在保存…</Text>}
+    {notice && <Text color="green">{notice}</Text>}
+    {error && <Text color="red">{error}</Text>}
+  </Box>;
+}
+
 /** 交互式终端，集中处理持久会话、任务中断和逐次权限确认。 */
 export function App({ config, sessionService, memoryService }: AppProps) {
   const { exit } = useApp();
@@ -78,11 +217,15 @@ export function App({ config, sessionService, memoryService }: AppProps) {
   const [elapsedMs, setElapsedMs] = useState(0);
   const [permission, setPermission] = useState<PermissionRequest | null>(null);
   const [toolLog, setToolLog] = useState<string[]>([]);
+  const [memoryCandidates, setMemoryCandidates] = useState<StoredMemoryCandidate[]>([]);
+  const [memoryManagerOpen, setMemoryManagerOpen] = useState(false);
+  const [, setMemoryRevision] = useState(0);
   const controllerRef = useRef<AbortController | null>(null);
   const textRef = useRef('');
   const startedAtRef = useRef(0);
   const interruptedRef = useRef(false);
   const workspaceRef = useRef(config.workspace);
+  const sessionIdRef = useRef('');
   const gate = useMemo(() => new PermissionGate(setPermission), []);
 
   /** 所有终端输出均在完整文本上脱敏，阻止终端控制字符。 */
@@ -93,6 +236,7 @@ export function App({ config, sessionService, memoryService }: AppProps) {
   /** 读取会话详情并替换当前终端历史。 */
   function loadSession(id: string, notice?: string): void {
     const detail = sessionService.load(id);
+    sessionIdRef.current = id;
     setSessionId(id);
     setMessages([
       ...detail.messages.map(toMessage),
@@ -100,6 +244,8 @@ export function App({ config, sessionService, memoryService }: AppProps) {
     ]);
     setResponse('');
     setToolLog([]);
+    setMemoryCandidates([]);
+    setMemoryManagerOpen(false);
     setStatus(statusLabel(detail.status));
   }
 
@@ -211,25 +357,60 @@ export function App({ config, sessionService, memoryService }: AppProps) {
   async function deleteSession(inputId: string): Promise<void> {
     const session = resolveSession(listSessions(), inputId);
     sessionService.remove(session.id);
-    if (session.id === sessionId) {
+    if (session.id === sessionIdRef.current) {
       await createNewSession();
     }
     appendNotice(`已删除会话 ${session.id.slice(0, 8)}`);
   }
 
-  /** 展示项目记忆摘要，完整交互由记忆管理界面接管。 */
+  /** 打开当前工作区的正式记忆管理界面。 */
   function openMemoryManager(): void {
-    const state = memoryService.getState(sessionId);
-    appendNotice(state.memories.length
-      ? `项目记忆\n${state.memories.map((memory, index) =>
-        `${index + 1}. ${memory.active ? '[启用]' : '[停用]'} ${memory.content}`,
-      ).join('\n')}`
-      : '项目记忆\n当前没有已确认记忆');
+    setMemoryManagerOpen(true);
+  }
+
+  /** 编辑正式记忆并触发管理界面刷新。 */
+  async function editMemory(memoryId: string, content: string): Promise<void> {
+    memoryService.updateMemory(sessionIdRef.current, memoryId, { content });
+    setMemoryRevision((revision) => revision + 1);
+  }
+
+  /** 停用或恢复正式记忆并触发管理界面刷新。 */
+  async function toggleMemory(memory: StoredMemory): Promise<void> {
+    memoryService.updateMemory(sessionIdRef.current, memory.id, {
+      active: !memory.active,
+    });
+    setMemoryRevision((revision) => revision + 1);
+  }
+
+  /** 删除正式记忆并触发管理界面刷新。 */
+  async function deleteMemory(memoryId: string): Promise<void> {
+    memoryService.deleteMemory(sessionIdRef.current, memoryId);
+    setMemoryRevision((revision) => revision + 1);
+  }
+
+  /** 接受候选原文或编辑后的内容。 */
+  async function acceptMemoryCandidate(
+    candidateId: string,
+    content?: string,
+  ): Promise<void> {
+    await memoryService.resolveCandidate(sessionIdRef.current, candidateId, {
+      action: 'accept',
+      content,
+    });
+  }
+
+  /** 忽略当前工作区的一条候选记忆。 */
+  async function ignoreMemoryCandidate(candidateId: string): Promise<void> {
+    await memoryService.resolveCandidate(sessionIdRef.current, candidateId, {
+      action: 'ignore',
+    });
   }
 
   /** 通过共享会话服务执行普通任务或图片命令。 */
   async function runTask(prompt: string): Promise<void> {
+    const runSessionId = sessionIdRef.current;
     const controller = new AbortController();
+    let extraction: Promise<StoredMemoryCandidate[]> | null = null;
     controllerRef.current = controller;
     interruptedRef.current = false;
     textRef.current = '';
@@ -240,7 +421,7 @@ export function App({ config, sessionService, memoryService }: AppProps) {
     setElapsedMs(0);
     setStatus('正在连接模型');
     try {
-      const result = await sessionService.run(sessionId, prompt, {
+      const result = await sessionService.run(runSessionId, prompt, {
         onAgentEvent,
         onDisplayMessage: (message) => {
           setMessages((items) => [...items, toMessage(message)]);
@@ -248,7 +429,7 @@ export function App({ config, sessionService, memoryService }: AppProps) {
         onStatus: (nextStatus) => setStatus(statusLabel(nextStatus)),
         confirm: (request, signal) => gate.request(request, signal),
       }, controller.signal);
-      void result.memoryExtraction?.catch(() => {});
+      extraction = result.memoryExtraction;
     } catch {
       // SessionService 已持久化并通知失败或取消提示。
     } finally {
@@ -256,6 +437,18 @@ export function App({ config, sessionService, memoryService }: AppProps) {
       setResponse('');
       setBusy(false);
       setStatus('就绪');
+    }
+    if (!extraction) return;
+    const candidates = await extraction.catch((error) => {
+      if (sessionIdRef.current === runSessionId) {
+        appendNotice(`记忆提取失败：${sanitize(
+          error instanceof Error ? error.message : String(error),
+        )}`);
+      }
+      return [];
+    });
+    if (sessionIdRef.current === runSessionId && candidates.length > 0) {
+      setMemoryCandidates((existing) => [...existing, ...candidates]);
     }
   }
 
@@ -296,6 +489,27 @@ export function App({ config, sessionService, memoryService }: AppProps) {
   if (permission) {
     return <PermissionPrompt key={`${permission.title}:${permission.detail}`}
       request={{ title: sanitize(permission.title), detail: sanitize(permission.detail) }} />;
+  }
+  if (!busy && memoryCandidates.length > 0) {
+    return <MemoryPrompt
+      candidates={memoryCandidates}
+      onAccept={acceptMemoryCandidate}
+      onIgnore={ignoreMemoryCandidate}
+      onDone={() => {
+        const count = memoryCandidates.length;
+        setMemoryCandidates([]);
+        appendNotice(`已处理 ${count} 条候选记忆`);
+      }}
+    />;
+  }
+  if (memoryManagerOpen) {
+    return <MemoryManager
+      memories={memoryService.getState(sessionId).memories}
+      onEdit={editMemory}
+      onToggle={toggleMemory}
+      onDelete={deleteMemory}
+      onClose={() => setMemoryManagerOpen(false)}
+    />;
   }
 
   return (

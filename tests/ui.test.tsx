@@ -10,6 +10,7 @@ import { PersistenceStore } from '../src/persistence/PersistenceStore.js';
 import type { ModelProvider } from '../src/providers/types.js';
 import { SessionService } from '../src/sessions/SessionService.js';
 import { ToolRegistry } from '../src/tools/ToolRegistry.js';
+import type { StoredMemoryCandidate } from '../src/persistence/types.js';
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -30,6 +31,30 @@ function createProvider(): ModelProvider {
       return { content: '你好，已收到', toolCalls: [] };
     },
     /** 图片确认拒绝时不应执行本方法。 */
+    async generateImage() { throw new Error('不应生成图片'); },
+  };
+}
+
+/** 返回三条稳定候选，覆盖接受、编辑和忽略交互。 */
+function createMemoryProvider(): ModelProvider {
+  return {
+    /** 普通任务返回回答，提取请求返回三条候选。 */
+    async chat(messages, _tools, onText) {
+      if (String(messages[0]?.content).includes('提取可长期复用的项目记忆')) {
+        return {
+          content: JSON.stringify({
+            candidates: [
+              { category: 'rule', content: '使用 pnpm' },
+              { category: 'decision', content: '使用 SQLite' },
+              { category: 'preference', content: '保持最小改动' },
+            ],
+          }),
+          toolCalls: [],
+        };
+      }
+      onText('已记录项目约定');
+      return { content: '已记录项目约定', toolCalls: [] };
+    },
     async generateImage() { throw new Error('不应生成图片'); },
   };
 }
@@ -86,14 +111,14 @@ async function runCompletedTurn(
   sessionService: SessionService,
   sessionId: string,
   prompt: string,
-): Promise<void> {
+): Promise<StoredMemoryCandidate[]> {
   const result = await sessionService.run(sessionId, prompt, {
     onAgentEvent: () => {},
     onDisplayMessage: () => {},
     onStatus: () => {},
     confirm: async () => true,
   }, new AbortController().signal);
-  await result.memoryExtraction;
+  return await result.memoryExtraction ?? [];
 }
 
 it('展示帮助、提交对话并清空历史', async () => {
@@ -201,4 +226,51 @@ it('列出、恢复和删除空闲 CLI 会话', async () => {
     workspace: config.workspace,
     clientType: 'cli',
   }).map(({ id }) => id)).not.toContain(secondId);
+});
+
+it('任务完成后逐条接受、编辑或忽略候选记忆', async () => {
+  const { view, config, sessionService, memoryService } =
+    await renderCli(createMemoryProvider());
+  await submit(view, '记住项目约定');
+  await vi.waitFor(() => expect(view.lastFrame()).toContain('候选记忆 1/3'));
+  view.stdin.write('a');
+  await vi.waitFor(() => expect(view.lastFrame()).toContain('候选记忆 2/3'));
+  view.stdin.write('e');
+  await vi.waitFor(() => expect(view.lastFrame()).toContain('编辑记忆'));
+  view.stdin.write('修改后的记忆');
+  view.stdin.write('\r');
+  await vi.waitFor(() => expect(view.lastFrame()).toContain('候选记忆 3/3'));
+  view.stdin.write('i');
+  await vi.waitFor(() => expect(view.lastFrame()).toContain('已处理 3 条候选记忆'));
+  const [session] = sessionService.list({
+    workspace: config.workspace,
+    clientType: 'cli',
+  });
+  expect(memoryService.getState(session!.id).memories.map((item) => item.content))
+    .toContain('使用 SQLite修改后的记忆');
+});
+
+it('memory 命令展示正式记忆并支持停用', async () => {
+  const provider = createMemoryProvider();
+  const { config, sessionService, memoryService } = await setupCliTest(provider);
+  const sessionId = await sessionService.create('cli', config.workspace);
+  const [candidate] = await runCompletedTurn(
+    sessionService,
+    sessionId,
+    '记住项目约定',
+  );
+  await memoryService.resolveCandidate(sessionId, candidate!.id, { action: 'accept' });
+  const view = render(<App
+    config={config}
+    sessionService={sessionService}
+    memoryService={memoryService}
+  />);
+  await vi.waitFor(() => expect(view.lastFrame()).toContain('❯'));
+  await submit(view, '/memory');
+  await vi.waitFor(() => expect(view.lastFrame()).toContain('项目记忆'));
+  view.stdin.write('1');
+  await vi.waitFor(() => expect(view.lastFrame()).toContain('记忆详情'));
+  view.stdin.write('t');
+  await vi.waitFor(() => expect(view.lastFrame()).toContain('已停用'));
+  expect(memoryService.getState(sessionId).memories[0]?.active).toBe(false);
 });
