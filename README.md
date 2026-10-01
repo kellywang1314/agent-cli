@@ -208,6 +208,12 @@ pnpm build
 
 自动测试使用临时工作区、本地 HTTP 模型网关和 Ink 输入事件，不请求真实 AIDP。覆盖文件越界、权限允许/拒绝、补丁过期、命令取消/超时/截断、流式参数组装、图片格式、消息配对、循环限制、终端交互，以及工作台鉴权、会话隔离、审批过期、重启恢复、持久化脱敏和记忆确认。
 
+默认测试不依赖 Redis。已启动本地 Redis 时，可额外运行真实缓存与 Pub/Sub 集成测试：
+
+```bash
+TEST_REDIS_URL=redis://127.0.0.1:6379 pnpm vitest run tests/redis.integration.test.ts
+```
+
 真实接口联调：
 
 1. 配置 `.env` 并启动 CLI，输入“只回复 OK”验证聊天地址和模型。

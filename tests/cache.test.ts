@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { NullCacheService } from '../src/cache/CacheService.js';
+import { createCacheService } from '../src/cache/createCacheService.js';
 import { RedisCacheService } from '../src/cache/RedisCacheService.js';
+
+const redisMock = vi.hoisted(() => ({
+  createClient: vi.fn(),
+}));
+vi.mock('redis', () => ({
+  createClient: redisMock.createClient,
+}));
 
 describe('缓存服务', () => {
   it('NullCacheService 永远未命中且所有操作可安全调用', async () => {
@@ -60,5 +68,32 @@ describe('缓存服务', () => {
     await expect(cache.delete('key')).resolves.toBeUndefined();
     await expect(cache.publish('channel', {})).resolves.toBeUndefined();
     expect(warning).toHaveBeenCalled();
+  });
+
+  it('首次 Redis 连接失败时停止重试并降级为空缓存', async () => {
+    let initialReconnectDecision: false | number | Error | undefined;
+    const command = {
+      on: vi.fn(),
+      connect: vi.fn(async () => {
+        initialReconnectDecision = reconnectStrategy?.(0, new Error('offline'));
+        throw new Error('offline');
+      }),
+      destroy: vi.fn(),
+    };
+    let reconnectStrategy:
+      | ((retries: number, cause: Error) => false | number | Error)
+      | undefined;
+    redisMock.createClient.mockImplementation((options) => {
+      reconnectStrategy = options.socket?.reconnectStrategy;
+      return command;
+    });
+    const warning = vi.fn();
+
+    const cache = await createCacheService('redis://127.0.0.1:6379', warning);
+
+    expect(cache).toBeInstanceOf(NullCacheService);
+    expect(initialReconnectDecision).toBe(false);
+    expect(command.destroy).toHaveBeenCalledOnce();
+    expect(warning).toHaveBeenCalledOnce();
   });
 });

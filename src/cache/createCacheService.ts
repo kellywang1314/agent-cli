@@ -19,15 +19,17 @@ export async function createCacheService(
   warning: (error: unknown) => void,
 ): Promise<CacheService> {
   if (!url) return new NullCacheService();
+  let connected = false;
   const command = createClient({
     url,
     socket: {
       connectTimeout: 1_000,
-      reconnectStrategy: (retries) => Math.min(100 * 2 ** retries, 1_000),
+      reconnectStrategy: (retries) => (
+        connected ? Math.min(100 * 2 ** retries, 1_000) : false
+      ),
     },
   });
   let subscriber: typeof command | null = null;
-  let connected = false;
   /** 仅在首次连接成功后报告运行时连接错误。 */
   const onError = (error: unknown): void => {
     if (connected) warning(error);
