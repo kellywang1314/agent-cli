@@ -19,6 +19,28 @@ export interface WebPermission {
   detail: string;
 }
 
+export interface WebMemoryCandidate {
+  id: string;
+  category: 'rule' | 'decision' | 'fact' | 'preference';
+  content: string;
+  createdAt: number;
+}
+
+export interface WebMemory {
+  id: string;
+  category: 'rule' | 'decision' | 'fact' | 'preference';
+  content: string;
+  active: boolean;
+  updatedAt: number;
+}
+
+export interface WebMemoryState {
+  extractionStatus: 'idle' | 'running' | 'failed' | 'complete';
+  extractionError: string | null;
+  candidates: WebMemoryCandidate[];
+  memories: WebMemory[];
+}
+
 export interface WebSessionSummary {
   id: string;
   title: string;

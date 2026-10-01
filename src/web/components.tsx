@@ -24,6 +24,9 @@ const iconPaths: Record<string, ReactNode> = {
   branch: <><circle cx="6" cy="5" r="2" /><circle cx="6" cy="19" r="2" /><circle cx="18" cy="6" r="2" /><path d="M6 7v10m12-9c0 6-12 3-12 7" /></>,
   spark: <path d="m12 2 3 7 7 3-7 3-3 7-3-7-7-3 7-3 3-7Z" />,
   shield: <path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Zm-4 9 3 3 5-6" />,
+  memory: <><path d="M7 4h10v16l-5-3-5 3V4Z" /><path d="M10 8h4" /></>,
+  edit: <><path d="m4 20 4-1 11-11-3-3L5 16l-1 4Z" /><path d="m14 7 3 3" /></>,
+  pause: <path d="M9 6v12m6-12v12" />,
 };
 
 /** 用统一线宽绘制轻量界面图标。 */

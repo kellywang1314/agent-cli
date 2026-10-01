@@ -532,3 +532,139 @@ it('服务重启后恢复其他工作区的 Web 会话', async () => {
   const detail = await (await second.request(`/api/sessions/${id}`)).json();
   expect(detail).toMatchObject({ id, workspace: await realpath(otherWorkspace) });
 });
+
+it('通过会话作用域接口管理记忆并拒绝跨工作区操作', async () => {
+  const otherWorkspace = await mkdtemp(path.join(os.tmpdir(), 'agent-web-memory-other-'));
+  cleanups.push(() => rm(otherWorkspace, { recursive: true, force: true }));
+  const provider: ModelProvider = {
+    /** 普通任务返回固定回答，记忆提取返回两条可确认候选。 */
+    async chat(messages) {
+      const content = messages[0]?.content;
+      if (messages.length === 1 && typeof content === 'string' &&
+        content.includes('提取可长期复用的项目记忆')) {
+        return {
+          content: JSON.stringify({
+            candidates: [
+              { category: 'rule', content: '使用 React 19' },
+              { category: 'preference', content: '保持最小改动' },
+              { category: 'fact', content: '运行在 Node.js 22' },
+            ],
+          }),
+          toolCalls: [],
+        };
+      }
+      return { content: '已记录要求', toolCalls: [] };
+    },
+    generateImage: textProvider.generateImage,
+  };
+  const { request } = await setup(provider);
+  const { id } = await (await request('/api/sessions', {})).json();
+  const { id: otherId } = await (await request('/api/sessions', {
+    workspace: otherWorkspace,
+  })).json();
+  await request(`/api/sessions/${id}/message`, { prompt: '记住项目约束' });
+  await waitForState(request, (state) =>
+    state.sessions.find((session: any) => session.id === id)
+      ?.memoryExtractionStatus === 'complete');
+
+  let memoryState = await (await request(`/api/sessions/${id}/memories`)).json();
+  expect(memoryState).toMatchObject({
+    extractionStatus: 'complete',
+    extractionError: null,
+    memories: [],
+  });
+  expect(memoryState.candidates).toEqual(expect.arrayContaining([
+    expect.objectContaining({ category: 'rule', content: '使用 React 19' }),
+    expect.objectContaining({ category: 'preference', content: '保持最小改动' }),
+    expect.objectContaining({ category: 'fact', content: '运行在 Node.js 22' }),
+  ]));
+  const retryResponse = await request(
+    `/api/sessions/${id}/memory-extraction/retry`,
+    {},
+  );
+  expect(retryResponse.status).toBe(200);
+  expect((await retryResponse.json()).candidates).toHaveLength(3);
+  const originalCandidate = memoryState.candidates.find(
+    (item: any) => item.category === 'rule',
+  );
+  const editedCandidate = memoryState.candidates.find(
+    (item: any) => item.category === 'preference',
+  );
+  const ignoredCandidate = memoryState.candidates.find(
+    (item: any) => item.category === 'fact',
+  );
+  expect((await request(
+    `/api/sessions/${otherId}/memory-candidates/${originalCandidate.id}`,
+    { action: 'accept' },
+    'PATCH',
+  )).status).toBe(400);
+
+  expect((await request(
+    `/api/sessions/${id}/memory-candidates/${ignoredCandidate.id}`,
+    { action: 'ignore' },
+    'PATCH',
+  )).status).toBe(200);
+  expect((await request(
+    `/api/sessions/${id}/memory-candidates/${originalCandidate.id}`,
+    { action: 'accept' },
+    'PATCH',
+  )).status).toBe(200);
+  expect((await request(
+    `/api/sessions/${id}/memory-candidates/${editedCandidate.id}`,
+    { action: 'accept', content: '  偏好 minimal diff  ' },
+    'PATCH',
+  )).status).toBe(200);
+
+  memoryState = await (await request(`/api/sessions/${id}/memories`)).json();
+  expect(memoryState.candidates).toEqual([]);
+  expect(memoryState.memories).toEqual(expect.arrayContaining([
+    expect.objectContaining({ category: 'rule', content: '使用 React 19', active: true }),
+    expect.objectContaining({ category: 'preference', content: '偏好 minimal diff', active: true }),
+  ]));
+  const memory = memoryState.memories.find((item: any) => item.category === 'preference');
+
+  expect((await request(
+    `/api/sessions/${id}/memories/${memory.id}`,
+    {},
+    'PATCH',
+  )).status).toBe(400);
+  expect((await request(
+    `/api/sessions/${otherId}/memories/${memory.id}`,
+    { content: '越权修改' },
+    'PATCH',
+  )).status).toBe(400);
+  expect((await request(
+    `/api/sessions/${otherId}/memories/${memory.id}`,
+    undefined,
+    'DELETE',
+  )).status).toBe(400);
+  expect((await request(
+    `/api/sessions/${id}/memories/${memory.id}`,
+    { content: '  只做必要修改  ' },
+    'PATCH',
+  )).status).toBe(200);
+  expect((await request(
+    `/api/sessions/${id}/memories/${memory.id}`,
+    { active: false },
+    'PATCH',
+  )).status).toBe(200);
+  memoryState = await (await request(`/api/sessions/${id}/memories`)).json();
+  expect(memoryState.memories).toContainEqual(expect.objectContaining({
+    id: memory.id,
+    content: '只做必要修改',
+    active: false,
+  }));
+
+  expect((await request(
+    `/api/sessions/${id}/memories/${memory.id}`,
+    { active: true },
+    'PATCH',
+  )).status).toBe(200);
+  expect((await request(
+    `/api/sessions/${id}/memories/${memory.id}`,
+    undefined,
+    'DELETE',
+  )).status).toBe(200);
+  memoryState = await (await request(`/api/sessions/${id}/memories`)).json();
+  expect(memoryState.memories).not.toContainEqual(expect.objectContaining({ id: memory.id }));
+});

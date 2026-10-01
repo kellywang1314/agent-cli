@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from './api.js';
 import { CodeView, CopyButton, Icon, ToolCard, toolText } from './components.js';
+import { MemoryPanel } from './MemoryPanel.js';
 import type { WebSession } from './types.js';
 
-/** 提供工具活动、文件浏览和只读 Git 差异检查面板。 */
+/** 提供工具活动、文件、Git 差异和长期记忆面板。 */
 export function Inspector({ session, onClose }: { session?: WebSession; onClose: () => void }) {
-  const [tab, setTab] = useState<'activity' | 'files' | 'diff'>('activity');
+  const [tab, setTab] = useState<'activity' | 'files' | 'diff' | 'memory'>('activity');
   const [files, setFiles] = useState<string[]>([]);
   const [filter, setFilter] = useState('');
   const [selectedFile, setSelectedFile] = useState('');
@@ -42,7 +43,7 @@ export function Inspector({ session, onClose }: { session?: WebSession; onClose:
     setError('');
     setTruncated(false);
     setLoading(false);
-    if (tab !== 'activity') void inspect(tab);
+    if (tab === 'files' || tab === 'diff') void inspect(tab);
     return () => { requestVersion.current++; };
   }, [session?.id, tab]);
 
@@ -52,9 +53,10 @@ export function Inspector({ session, onClose }: { session?: WebSession; onClose:
       <button className="icon-button" onClick={onClose} title="关闭工作区面板" aria-label="关闭工作区面板"><Icon name="close" size={16} /></button>
     </div>
     <div className="inspector-tabs" role="tablist" aria-label="工作区面板">
-      {([['activity', '活动'], ['files', '文件'], ['diff', '变更']] as const).map(([value, label]) =>
+      {([['activity', '活动'], ['files', '文件'], ['diff', '变更'], ['memory', '记忆']] as const).map(([value, label]) =>
         <button key={value} role="tab" aria-selected={tab === value} className={tab === value ? 'active' : ''} onClick={() => setTab(value)}>{label}
           {value === 'activity' && Boolean(session?.tools.length) && <span>{session?.tools.length}</span>}
+          {value === 'memory' && Boolean(session?.pendingMemoryCount) && <span>{session?.pendingMemoryCount}</span>}
         </button>)}
     </div>
     {tab === 'activity' ? <div className="inspector-body">
@@ -65,7 +67,10 @@ export function Inspector({ session, onClose }: { session?: WebSession; onClose:
           <div className="capability-list"><span><Icon name="search" size={15} />理解你的代码库</span>
             <span><Icon name="code" size={15} />预览与应用修改</span><span><Icon name="shield" size={15} />重要操作由你确认</span></div>
         </div>}
-    </div> : <>
+    </div> : tab === 'memory' ? <MemoryPanel
+      key={`${session?.id ?? ''}:${session?.memoryExtractionStatus ?? 'idle'}`}
+      sessionId={session?.id}
+    /> : <>
       <div className="file-toolbar">
         {tab === 'files' && selectedFile ? <button className="text-button" onClick={() => { setSelectedFile(''); void inspect('files'); }}>← 文件列表</button> :
           <span>{tab === 'files' ? `${files.length} 个路径` : '未暂存的 Git 差异'}</span>}

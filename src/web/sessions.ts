@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { AgentEvent } from '../agent/AgentLoop.js';
 import { redactSecrets, redactStream, type AgentConfig } from '../config/loadConfig.js';
 import type { MemoryService } from '../memory/MemoryService.js';
+import type { CandidateDecision } from '../memory/types.js';
 import type { StoredDisplayMessage, StoredSession } from '../persistence/types.js';
 import type { ModelProvider } from '../providers/types.js';
 import { PermissionGate } from '../security/PermissionGate.js';
@@ -11,6 +12,7 @@ import { ToolRegistry } from '../tools/ToolRegistry.js';
 import type { ToolContext } from '../tools/types.js';
 import type {
   InspectInput,
+  WebMemoryState,
   WebMessage,
   WebSession,
   WebSessionSummary,
@@ -205,6 +207,88 @@ export class SessionStore {
       workspace: this.sanitizeComplete(this.config.workspace),
       sessions: summaries,
     };
+  }
+
+  /** 返回 Web 会话可见的待处理候选和工作区正式记忆。 */
+  getMemoryState(id: string): WebMemoryState {
+    this.get(id);
+    const state = this.memories.getState(id);
+    return {
+      extractionStatus: state.extractionStatus,
+      extractionError: state.extractionError
+        ? this.sanitizeComplete(state.extractionError)
+        : null,
+      candidates: state.candidates
+        .filter(({ status }) => status === 'pending')
+        .map(({ id: candidateId, category, content, createdAt }) => ({
+          id: candidateId,
+          category,
+          content: this.sanitizeComplete(content),
+          createdAt,
+        })),
+      memories: state.memories.map(({
+        id: memoryId,
+        category,
+        content,
+        active,
+        updatedAt,
+      }) => ({
+        id: memoryId,
+        category,
+        content: this.sanitizeComplete(content),
+        active,
+        updatedAt,
+      })),
+    };
+  }
+
+  /** 在 Web 会话工作区内确认或忽略候选并通知订阅者。 */
+  async resolveMemoryCandidate(
+    id: string,
+    candidateId: string,
+    decision: CandidateDecision,
+  ): Promise<WebMemoryState> {
+    this.get(id);
+    await this.memories.resolveCandidate(id, candidateId, decision);
+    this.onChange(id);
+    return this.getMemoryState(id);
+  }
+
+  /** 在 Web 会话工作区内编辑、停用或恢复正式记忆。 */
+  updateMemory(
+    id: string,
+    memoryId: string,
+    patch: { content?: string; active?: boolean },
+  ): WebMemoryState {
+    this.get(id);
+    this.memories.updateMemory(id, memoryId, patch);
+    this.onChange(id);
+    return this.getMemoryState(id);
+  }
+
+  /** 在 Web 会话工作区内删除正式记忆。 */
+  deleteMemory(id: string, memoryId: string): WebMemoryState {
+    this.get(id);
+    this.memories.deleteMemory(id, memoryId);
+    this.onChange(id);
+    return this.getMemoryState(id);
+  }
+
+  /** 重试当前 Web 会话最后一轮完整普通任务的记忆提取。 */
+  async retryMemoryExtraction(id: string): Promise<WebMemoryState> {
+    this.get(id);
+    const extraction = this.sessions.retryMemoryExtraction(
+      id,
+      new AbortController().signal,
+    );
+    await Promise.resolve();
+    this.onChange(id);
+    try {
+      await extraction;
+    } finally {
+      this.onChange(id);
+    }
+    return this.getMemoryState(id);
   }
 
   /** 校验工作区并通过共享会话服务创建持久会话。 */

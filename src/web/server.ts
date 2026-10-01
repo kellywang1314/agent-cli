@@ -25,6 +25,20 @@ const inspectSchema = z.object({
   kind: z.enum(['files', 'file', 'diff']),
   path: z.string().max(4096).optional(),
 });
+const candidateDecisionSchema = z.discriminatedUnion('action', [
+  z.object({
+    action: z.literal('accept'),
+    content: z.string().trim().min(1).max(1000).optional(),
+  }).strict(),
+  z.object({ action: z.literal('ignore') }).strict(),
+]);
+const memoryPatchSchema = z.object({
+  content: z.string().trim().min(1).max(1000).optional(),
+  active: z.boolean().optional(),
+}).strict().refine(
+  ({ content, active }) => content !== undefined || active !== undefined,
+  { message: '记忆更新不能为空' },
+);
 
 /** 有界读取 JSON 输入，拒绝错误 MIME、超大请求和无效 JSON。 */
 async function readJson(request: IncomingMessage): Promise<unknown> {
@@ -189,6 +203,59 @@ export async function startWebServer(options: ServerOptions) {
     if (request.method === 'DELETE' && sessionMatch) {
       store.remove(sessionMatch[1]!);
       sendJson(response, 200, { ok: true });
+      return;
+    }
+    const memoriesMatch = /^\/api\/sessions\/([^/]+)\/memories$/.exec(url.pathname);
+    if (memoriesMatch) {
+      if (request.method !== 'GET') {
+        sendJson(response, 405, { error: '方法不支持' });
+        return;
+      }
+      sendJson(response, 200, store.getMemoryState(memoriesMatch[1]!));
+      return;
+    }
+    const retryMemoryMatch =
+      /^\/api\/sessions\/([^/]+)\/memory-extraction\/retry$/.exec(url.pathname);
+    if (retryMemoryMatch) {
+      if (request.method !== 'POST') {
+        sendJson(response, 405, { error: '方法不支持' });
+        return;
+      }
+      sendJson(response, 200, await store.retryMemoryExtraction(retryMemoryMatch[1]!));
+      return;
+    }
+    const candidateMatch =
+      /^\/api\/sessions\/([^/]+)\/memory-candidates\/([^/]+)$/.exec(url.pathname);
+    if (candidateMatch) {
+      if (request.method !== 'PATCH') {
+        sendJson(response, 405, { error: '方法不支持' });
+        return;
+      }
+      const decision = candidateDecisionSchema.parse(await readJson(request));
+      sendJson(response, 200, await store.resolveMemoryCandidate(
+        candidateMatch[1]!,
+        candidateMatch[2]!,
+        decision,
+      ));
+      return;
+    }
+    const memoryMatch =
+      /^\/api\/sessions\/([^/]+)\/memories\/([^/]+)$/.exec(url.pathname);
+    if (memoryMatch) {
+      if (request.method === 'PATCH') {
+        const patch = memoryPatchSchema.parse(await readJson(request));
+        sendJson(response, 200, store.updateMemory(
+          memoryMatch[1]!,
+          memoryMatch[2]!,
+          patch,
+        ));
+        return;
+      }
+      if (request.method === 'DELETE') {
+        sendJson(response, 200, store.deleteMemory(memoryMatch[1]!, memoryMatch[2]!));
+        return;
+      }
+      sendJson(response, 405, { error: '方法不支持' });
       return;
     }
     const match = /^\/api\/sessions\/([^/]+)\/(message|cancel|permission|inspect)$/.exec(url.pathname);
