@@ -70,6 +70,9 @@ export function Inspector({ session, onClose }: { session?: WebSession; onClose:
     </div> : tab === 'memory' ? <MemoryPanel
       key={session?.id ?? ''}
       sessionId={session?.id}
+      refreshToken={session
+        ? `${session.memoryExtractionStatus}:${session.pendingMemoryCount}`
+        : undefined}
     /> : <>
       <div className="file-toolbar">
         {tab === 'files' && selectedFile ? <button className="text-button" onClick={() => { setSelectedFile(''); void inspect('files'); }}>← 文件列表</button> :

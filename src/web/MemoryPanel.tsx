@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from './api.js';
 import { Icon } from './components.js';
+import {
+  groupMemoriesByCategory,
+  shouldRefreshMemoryState,
+} from './memoryPanelState.js';
 import type {
   WebMemory,
   WebMemoryCandidate,
@@ -13,9 +17,20 @@ const categoryLabels = {
   fact: '事实',
   preference: '偏好',
 } as const;
+const extractionStatusLabels = {
+  idle: '尚未提取',
+  running: '提取中',
+  failed: '提取失败',
+  complete: '提取完成',
+} as const;
+
+interface MemoryPanelProps {
+  sessionId?: string;
+  refreshToken?: string;
+}
 
 /** 展示并管理当前会话工作区内的长期记忆。 */
-export function MemoryPanel({ sessionId }: { sessionId?: string }) {
+export function MemoryPanel({ sessionId, refreshToken }: MemoryPanelProps) {
   const [state, setState] = useState<WebMemoryState | null>(null);
   const [loading, setLoading] = useState(false);
   const [pending, setPending] = useState(false);
@@ -27,6 +42,7 @@ export function MemoryPanel({ sessionId }: { sessionId?: string }) {
   const requestVersion = useRef(0);
   const operationVersion = useRef(0);
   const pendingRef = useRef(false);
+  const refreshTokenRef = useRef(refreshToken);
 
   /** 获取指定会话的记忆状态，并忽略会话切换后的旧响应。 */
   async function loadMemoryState(targetId: string, version: number): Promise<void> {
@@ -47,6 +63,7 @@ export function MemoryPanel({ sessionId }: { sessionId?: string }) {
   useEffect(() => {
     const version = ++requestVersion.current;
     operationVersion.current++;
+    refreshTokenRef.current = refreshToken;
     pendingRef.current = false;
     setPending(false);
     setError('');
@@ -64,10 +81,21 @@ export function MemoryPanel({ sessionId }: { sessionId?: string }) {
     return () => { requestVersion.current++; };
   }, [sessionId]);
 
+  useEffect(() => {
+    if (!sessionId || !shouldRefreshMemoryState(
+      refreshTokenRef.current,
+      refreshToken,
+      pendingRef.current,
+    )) return;
+    refreshTokenRef.current = refreshToken;
+    const version = ++requestVersion.current;
+    void loadMemoryState(sessionId, version);
+  }, [sessionId, refreshToken, pending]);
+
   /** 串行执行写操作，仅让当前会话的最新操作更新面板。 */
   async function perform(action: () => Promise<WebMemoryState>): Promise<boolean> {
     if (pendingRef.current) return false;
-    const request = requestVersion.current;
+    const request = ++requestVersion.current;
     const operation = ++operationVersion.current;
     pendingRef.current = true;
     setPending(true);
@@ -198,6 +226,11 @@ export function MemoryPanel({ sessionId }: { sessionId?: string }) {
 
   return <div className="memory-panel">
     {error && <div className="panel-error" role="alert">{error}</div>}
+    <div className="memory-summary">
+      <span>提取状态</span>
+      <strong>{extractionStatusLabels[state.extractionStatus]}</strong>
+      <span>待确认 {state.candidates.length}</span>
+    </div>
     {state?.extractionStatus === 'running' && <div className="memory-extraction">
       <span className="spinner" />正在提取记忆…
     </div>}
@@ -256,46 +289,49 @@ export function MemoryPanel({ sessionId }: { sessionId?: string }) {
         <strong><Icon name="memory" size={13} />已确认</strong>
         <span>{state?.memories.length ?? 0}</span>
       </div>
-      {state?.memories.length ? state.memories.map((memory) =>
-        <article className={`memory-row ${memory.active ? '' : 'inactive'}`} key={memory.id}>
-          <div className="memory-row-meta">
-            <span>{categoryLabels[memory.category]}</span>
-            <time>{new Date(memory.updatedAt).toLocaleDateString('zh-CN')}</time>
-          </div>
-          {editingMemoryId === memory.id ? <div className="memory-editor">
-            <textarea value={memoryDraft} maxLength={1000} rows={4}
-              aria-label="编辑正式记忆"
-              onChange={(event) => setMemoryDraft(event.target.value)} />
-            <div className="memory-actions">
-              <button className="memory-action" disabled={pending}
-                onClick={() => { setEditingMemoryId(''); setMemoryDraft(''); }}>
-                <Icon name="close" size={13} />取消
-              </button>
-              <button className="memory-action primary"
-                disabled={pending || !memoryDraft.trim()}
-                onClick={() => void saveMemory(memory.id)}>
-                <Icon name="check" size={13} />保存
-              </button>
-            </div>
-          </div> : <>
-            <p className="memory-content">{memory.content}</p>
-            <div className="memory-actions">
-              <button className="memory-action" disabled={pending}
-                onClick={() => editMemory(memory)}>
-                <Icon name="edit" size={13} />编辑
-              </button>
-              <button className="memory-action" disabled={pending}
-                onClick={() => void toggleMemory(memory)}>
-                <Icon name={memory.active ? 'pause' : 'refresh'} size={13} />
-                {memory.active ? '停用' : '恢复'}
-              </button>
-              <button className="memory-action danger" disabled={pending}
-                onClick={() => void deleteMemory(memory.id)}>
-                <Icon name="trash" size={13} />删除
-              </button>
-            </div>
-          </>}
-        </article>) : <div className="memory-empty">当前没有已确认记忆。</div>}
+      {state?.memories.length ? groupMemoriesByCategory(state.memories).map((group) =>
+        <div className="memory-category-group" key={group.category}>
+          <div className="memory-category-heading">{categoryLabels[group.category]}</div>
+          {group.memories.map((memory) =>
+            <article className={`memory-row ${memory.active ? '' : 'inactive'}`} key={memory.id}>
+              <div className="memory-row-meta">
+                <time>{new Date(memory.updatedAt).toLocaleDateString('zh-CN')}</time>
+              </div>
+              {editingMemoryId === memory.id ? <div className="memory-editor">
+                <textarea value={memoryDraft} maxLength={1000} rows={4}
+                  aria-label="编辑正式记忆"
+                  onChange={(event) => setMemoryDraft(event.target.value)} />
+                <div className="memory-actions">
+                  <button className="memory-action" disabled={pending}
+                    onClick={() => { setEditingMemoryId(''); setMemoryDraft(''); }}>
+                    <Icon name="close" size={13} />取消
+                  </button>
+                  <button className="memory-action primary"
+                    disabled={pending || !memoryDraft.trim()}
+                    onClick={() => void saveMemory(memory.id)}>
+                    <Icon name="check" size={13} />保存
+                  </button>
+                </div>
+              </div> : <>
+                <p className="memory-content">{memory.content}</p>
+                <div className="memory-actions">
+                  <button className="memory-action" disabled={pending}
+                    onClick={() => editMemory(memory)}>
+                    <Icon name="edit" size={13} />编辑
+                  </button>
+                  <button className="memory-action" disabled={pending}
+                    onClick={() => void toggleMemory(memory)}>
+                    <Icon name={memory.active ? 'pause' : 'refresh'} size={13} />
+                    {memory.active ? '停用' : '恢复'}
+                  </button>
+                  <button className="memory-action danger" disabled={pending}
+                    onClick={() => void deleteMemory(memory.id)}>
+                    <Icon name="trash" size={13} />删除
+                  </button>
+                </div>
+              </>}
+            </article>)}
+        </div>) : <div className="memory-empty">当前没有已确认记忆。</div>}
     </section>
   </div>;
 }
