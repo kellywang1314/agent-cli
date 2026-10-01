@@ -24,7 +24,6 @@ async function main(): Promise<void> {
     .option('redis-cache-ttl', {
       type: 'number',
       describe: 'Redis 缓存 TTL 秒数',
-      default: 300,
     })
     .strict().help().parse();
   if (!Number.isInteger(args.port) || args.port < 0 || args.port > 65535) throw new Error('端口必须是 0–65535 的整数');

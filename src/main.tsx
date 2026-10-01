@@ -30,7 +30,6 @@ async function main(): Promise<void> {
     .option('redis-cache-ttl', {
       type: 'number',
       describe: 'Redis 缓存 TTL 秒数',
-      default: 300,
     })
     .strict()
     .version('0.1.0')
