@@ -22,6 +22,8 @@ export function MemoryPanel({ sessionId }: { sessionId?: string }) {
   const [error, setError] = useState('');
   const [editingCandidateId, setEditingCandidateId] = useState('');
   const [draft, setDraft] = useState('');
+  const [editingMemoryId, setEditingMemoryId] = useState('');
+  const [memoryDraft, setMemoryDraft] = useState('');
   const requestVersion = useRef(0);
   const operationVersion = useRef(0);
   const pendingRef = useRef(false);
@@ -50,6 +52,8 @@ export function MemoryPanel({ sessionId }: { sessionId?: string }) {
     setError('');
     setEditingCandidateId('');
     setDraft('');
+    setEditingMemoryId('');
+    setMemoryDraft('');
     setState(null);
     if (!sessionId) {
       setLoading(false);
@@ -140,6 +144,20 @@ export function MemoryPanel({ sessionId }: { sessionId?: string }) {
     ));
   }
 
+  /** 保存正式记忆编辑内容，并在成功后关闭编辑器。 */
+  async function saveMemory(memoryId: string): Promise<void> {
+    if (!sessionId) return;
+    const saved = await perform(() => api<WebMemoryState>(
+      `/api/sessions/${sessionId}/memories/${memoryId}`,
+      { content: memoryDraft },
+      'PATCH',
+    ));
+    if (saved) {
+      setEditingMemoryId('');
+      setMemoryDraft('');
+    }
+  }
+
   /** 经用户确认后永久删除正式记忆。 */
   async function deleteMemory(memoryId: string): Promise<void> {
     if (!sessionId || !window.confirm('删除这条记忆？此操作无法撤销。')) return;
@@ -154,6 +172,12 @@ export function MemoryPanel({ sessionId }: { sessionId?: string }) {
   function editCandidate(candidate: WebMemoryCandidate): void {
     setEditingCandidateId(candidate.id);
     setDraft(candidate.content);
+  }
+
+  /** 打开正式记忆编辑器并以当前内容作为独立草稿。 */
+  function editMemory(memory: WebMemory): void {
+    setEditingMemoryId(memory.id);
+    setMemoryDraft(memory.content);
   }
 
   if (!sessionId) {
@@ -238,18 +262,39 @@ export function MemoryPanel({ sessionId }: { sessionId?: string }) {
             <span>{categoryLabels[memory.category]}</span>
             <time>{new Date(memory.updatedAt).toLocaleDateString('zh-CN')}</time>
           </div>
-          <p className="memory-content">{memory.content}</p>
-          <div className="memory-actions">
-            <button className="memory-action" disabled={pending}
-              onClick={() => void toggleMemory(memory)}>
-              <Icon name={memory.active ? 'pause' : 'refresh'} size={13} />
-              {memory.active ? '停用' : '恢复'}
-            </button>
-            <button className="memory-action danger" disabled={pending}
-              onClick={() => void deleteMemory(memory.id)}>
-              <Icon name="trash" size={13} />删除
-            </button>
-          </div>
+          {editingMemoryId === memory.id ? <div className="memory-editor">
+            <textarea value={memoryDraft} maxLength={1000} rows={4}
+              aria-label="编辑正式记忆"
+              onChange={(event) => setMemoryDraft(event.target.value)} />
+            <div className="memory-actions">
+              <button className="memory-action" disabled={pending}
+                onClick={() => { setEditingMemoryId(''); setMemoryDraft(''); }}>
+                <Icon name="close" size={13} />取消
+              </button>
+              <button className="memory-action primary"
+                disabled={pending || !memoryDraft.trim()}
+                onClick={() => void saveMemory(memory.id)}>
+                <Icon name="check" size={13} />保存
+              </button>
+            </div>
+          </div> : <>
+            <p className="memory-content">{memory.content}</p>
+            <div className="memory-actions">
+              <button className="memory-action" disabled={pending}
+                onClick={() => editMemory(memory)}>
+                <Icon name="edit" size={13} />编辑
+              </button>
+              <button className="memory-action" disabled={pending}
+                onClick={() => void toggleMemory(memory)}>
+                <Icon name={memory.active ? 'pause' : 'refresh'} size={13} />
+                {memory.active ? '停用' : '恢复'}
+              </button>
+              <button className="memory-action danger" disabled={pending}
+                onClick={() => void deleteMemory(memory.id)}>
+                <Icon name="trash" size={13} />删除
+              </button>
+            </div>
+          </>}
         </article>) : <div className="memory-empty">当前没有已确认记忆。</div>}
     </section>
   </div>;

@@ -578,6 +578,44 @@ it('通过会话作用域接口管理记忆并拒绝跨工作区操作', async (
     expect.objectContaining({ category: 'preference', content: '保持最小改动' }),
     expect.objectContaining({ category: 'fact', content: '运行在 Node.js 22' }),
   ]));
+  /** 断言无效记忆请求被拒绝，且不会改变当前记忆状态。 */
+  async function expectRejectedMemoryRequest(
+    name: string,
+    route: string,
+    body: unknown,
+    method: string,
+    expectedStatus: 400 | 405,
+  ): Promise<void> {
+    const before = await (await request(`/api/sessions/${id}/memories`)).json();
+    const response = await request(route, body, method);
+    expect(response.status, name).toBe(expectedStatus);
+    const after = await (await request(`/api/sessions/${id}/memories`)).json();
+    expect(after, `${name} 不应改变记忆状态`).toEqual(before);
+  }
+
+  for (const invalidMethod of [
+    {
+      name: 'GET memories',
+      route: `/api/sessions/${id}/memories`,
+      body: {},
+      method: 'POST',
+    },
+    {
+      name: 'retry',
+      route: `/api/sessions/${id}/memory-extraction/retry`,
+      body: undefined,
+      method: 'GET',
+    },
+  ]) {
+    await expectRejectedMemoryRequest(
+      invalidMethod.name,
+      invalidMethod.route,
+      invalidMethod.body,
+      invalidMethod.method,
+      405,
+    );
+  }
+
   const retryResponse = await request(
     `/api/sessions/${id}/memory-extraction/retry`,
     {},
@@ -593,6 +631,46 @@ it('通过会话作用域接口管理记忆并拒绝跨工作区操作', async (
   const ignoredCandidate = memoryState.candidates.find(
     (item: any) => item.category === 'fact',
   );
+  for (const invalidCandidateRequest of [
+    {
+      name: 'candidate 错误方法',
+      body: { action: 'accept' },
+      method: 'POST',
+      expectedStatus: 405 as const,
+    },
+    {
+      name: 'accept 空白内容',
+      body: { action: 'accept', content: '   ' },
+      method: 'PATCH',
+      expectedStatus: 400 as const,
+    },
+    {
+      name: 'accept 超长内容',
+      body: { action: 'accept', content: 'x'.repeat(1001) },
+      method: 'PATCH',
+      expectedStatus: 400 as const,
+    },
+    {
+      name: 'accept 额外字段',
+      body: { action: 'accept', extra: true },
+      method: 'PATCH',
+      expectedStatus: 400 as const,
+    },
+    {
+      name: 'ignore 非法字段',
+      body: { action: 'ignore', content: '不应接受' },
+      method: 'PATCH',
+      expectedStatus: 400 as const,
+    },
+  ]) {
+    await expectRejectedMemoryRequest(
+      invalidCandidateRequest.name,
+      `/api/sessions/${id}/memory-candidates/${originalCandidate.id}`,
+      invalidCandidateRequest.body,
+      invalidCandidateRequest.method,
+      invalidCandidateRequest.expectedStatus,
+    );
+  }
   expect((await request(
     `/api/sessions/${otherId}/memory-candidates/${originalCandidate.id}`,
     { action: 'accept' },
@@ -623,11 +701,52 @@ it('通过会话作用域接口管理记忆并拒绝跨工作区操作', async (
   ]));
   const memory = memoryState.memories.find((item: any) => item.category === 'preference');
 
-  expect((await request(
-    `/api/sessions/${id}/memories/${memory.id}`,
-    {},
-    'PATCH',
-  )).status).toBe(400);
+  for (const invalidMemoryRequest of [
+    {
+      name: 'memory patch 空对象',
+      body: {},
+      method: 'PATCH',
+      expectedStatus: 400 as const,
+    },
+    {
+      name: 'memory patch 额外字段',
+      body: { active: true, extra: true },
+      method: 'PATCH',
+      expectedStatus: 400 as const,
+    },
+    {
+      name: 'memory patch 空白内容',
+      body: { content: '   ' },
+      method: 'PATCH',
+      expectedStatus: 400 as const,
+    },
+    {
+      name: 'memory patch 超长内容',
+      body: { content: 'x'.repeat(1001) },
+      method: 'PATCH',
+      expectedStatus: 400 as const,
+    },
+    {
+      name: 'memory patch 非 boolean active',
+      body: { active: 'false' },
+      method: 'PATCH',
+      expectedStatus: 400 as const,
+    },
+    {
+      name: 'memory item 错误方法',
+      body: {},
+      method: 'POST',
+      expectedStatus: 405 as const,
+    },
+  ]) {
+    await expectRejectedMemoryRequest(
+      invalidMemoryRequest.name,
+      `/api/sessions/${id}/memories/${memory.id}`,
+      invalidMemoryRequest.body,
+      invalidMemoryRequest.method,
+      invalidMemoryRequest.expectedStatus,
+    );
+  }
   expect((await request(
     `/api/sessions/${otherId}/memories/${memory.id}`,
     { content: '越权修改' },

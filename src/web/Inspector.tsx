@@ -68,7 +68,7 @@ export function Inspector({ session, onClose }: { session?: WebSession; onClose:
             <span><Icon name="code" size={15} />预览与应用修改</span><span><Icon name="shield" size={15} />重要操作由你确认</span></div>
         </div>}
     </div> : tab === 'memory' ? <MemoryPanel
-      key={`${session?.id ?? ''}:${session?.memoryExtractionStatus ?? 'idle'}`}
+      key={session?.id ?? ''}
       sessionId={session?.id}
     /> : <>
       <div className="file-toolbar">
